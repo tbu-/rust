@@ -11,6 +11,16 @@
 // FIXME(Gankro): Bitv and BitvSet are very tightly coupled. Ideally (for maintenance),
 // they should be in separate files/modules, with BitvSet only using Bitv's public API.
 
+// First rule of Bitv club: almost everything can actually overflow because we're working with
+// bits and not bytes.
+//
+// Second rule of Bitv club: the last "block" of bits may be partially used. We must ensure that
+// those unused bits are zeroed out, as other methods will assume this is the case. It may be
+// the case that this isn't a great design, but having "undefined" bits is headache-inducing.
+//
+// Third rule of Bitv club: BitvSet is fairly tightly coupled to Bitv's implementation details.
+// Make sure any changes to Bitv are properly addressed in BitvSet.
+
 //! Collections implemented with bit vectors.
 //!
 //! # Examples
@@ -31,7 +41,7 @@
 //! let primes = {
 //!     // Assume all numbers are prime to begin, and then we
 //!     // cross off non-primes progressively
-//!     let mut bv = Bitv::with_capacity(max_prime, true);
+//!     let mut bv = Bitv::from_elem(max_prime, true);
 //!
 //!     // Neither 0 nor 1 are prime
 //!     bv.set(0, false);
@@ -68,18 +78,18 @@ use core::prelude::*;
 use core::cmp;
 use core::default::Default;
 use core::fmt;
-use core::iter::{Chain, Enumerate, Repeat, Skip, Take, repeat};
+use core::iter::{Cloned, Chain, Enumerate, Repeat, Skip, Take};
 use core::iter;
 use core::num::Int;
-use core::slice;
-use core::u32;
+use core::slice::{Items, MutItems};
+use core::{u32, uint};
 use std::hash;
 
 use vec::Vec;
 
-// FIXME(conventions): look, we just need to refactor this whole thing. Inside and out.
+type Blocks<'a> = Take<Cloned<Items<'a, u32>>>;
+type MatchWords<'a> = Chain<Enumerate<Blocks<'a>>, Skip<Take<Enumerate<Repeat<u32>>>>>;
 
-type MatchWords<'a> = Chain<MaskWords<'a>, Skip<Take<Enumerate<Repeat<u32>>>>>;
 // Take two BitV's, and return iterators of their words, where the shorter one
 // has been padded with 0's
 fn match_words <'a,'b>(a: &'a Bitv, b: &'b Bitv) -> (MatchWords<'a>, MatchWords<'b>) {
@@ -88,11 +98,11 @@ fn match_words <'a,'b>(a: &'a Bitv, b: &'b Bitv) -> (MatchWords<'a>, MatchWords<
 
     // have to uselessly pretend to pad the longer one for type matching
     if a_len < b_len {
-        (a.mask_words(0).chain(repeat(0u32).enumerate().take(b_len).skip(a_len)),
-         b.mask_words(0).chain(repeat(0u32).enumerate().take(0).skip(0)))
+        (a.blocks().enumerate().chain(iter::repeat(0u32).enumerate().take(b_len).skip(a_len)),
+         b.blocks().enumerate().chain(iter::repeat(0u32).enumerate().take(0).skip(0)))
     } else {
-        (a.mask_words(0).chain(repeat(0u32).enumerate().take(0).skip(0)),
-         b.mask_words(0).chain(repeat(0u32).enumerate().take(a_len).skip(b_len)))
+        (a.blocks().enumerate().chain(iter::repeat(0u32).enumerate().take(0).skip(0)),
+         b.blocks().enumerate().chain(iter::repeat(0u32).enumerate().take(a_len).skip(b_len)))
     }
 }
 
@@ -106,7 +116,7 @@ static FALSE: bool = false;
 /// ```rust
 /// use collections::Bitv;
 ///
-/// let mut bv = Bitv::with_capacity(10, false);
+/// let mut bv = Bitv::from_elem(10, false);
 ///
 /// // insert all primes less than 10
 /// bv.set(2, true);
@@ -133,6 +143,7 @@ pub struct Bitv {
     nbits: uint
 }
 
+// FIXME(Gankro): NopeNopeNopeNopeNope (wait for IndexGet to be a thing)
 impl Index<uint,bool> for Bitv {
     #[inline]
     fn index<'a>(&'a self, i: &uint) -> &'a bool {
@@ -144,35 +155,27 @@ impl Index<uint,bool> for Bitv {
     }
 }
 
-struct MaskWords<'a> {
-    iter: slice::Items<'a, u32>,
-    next_word: Option<&'a u32>,
-    last_word_mask: u32,
-    offset: uint
-}
-
-impl<'a> Iterator<(uint, u32)> for MaskWords<'a> {
-    /// Returns (offset, word)
-    #[inline]
-    fn next<'a>(&'a mut self) -> Option<(uint, u32)> {
-        let ret = self.next_word;
-        match ret {
-            Some(&w) => {
-                self.next_word = self.iter.next();
-                self.offset += 1;
-                // The last word may need to be masked
-                if self.next_word.is_none() {
-                    Some((self.offset - 1, w & self.last_word_mask))
-                } else {
-                    Some((self.offset - 1, w))
-                }
-            },
-            None => None
-        }
+/// Computes how many blocks are needed to store that many bits
+fn blocks_for_bits(bits: uint) -> uint {
+    // If we want 17 bits, dividing by 32 will produce 0. So we add 1 to make sure we
+    // reserve enough. But if we want exactly a multiple of 32, this will actually allocate
+    // one too many. So we need to check if that's the case. We can do that by computing if
+    // bitwise AND by `32 - 1` is 0. But LLVM should be able to optimize the semantically
+    // superior modulo operator on a power of two to this.
+    //
+    // Note that we can technically avoid this branch with the expression
+    // `(nbits + u32::BITS - 1) / 32::BITS`, but if nbits is almost uint::MAX this will overflow.
+    if bits % u32::BITS == 0 {
+        bits / u32::BITS
+    } else {
+        bits / u32::BITS + 1
     }
+
 }
 
 impl Bitv {
+    /// Applies the given operation to the blocks of self and other, and sets self to
+    /// be the result.
     #[inline]
     fn process(&mut self, other: &Bitv, op: |u32, u32| -> u32) -> bool {
         let len = other.storage.len();
@@ -182,8 +185,7 @@ impl Bitv {
         // `op` is a bitwise operation, since any bits that should've
         // been masked were fine to change anyway. `b` is masked to
         // make sure its unmasked bits do not cause damage.
-        for (a, (_, b)) in self.storage.iter_mut()
-                           .zip(other.mask_words(0)) {
+        for (a, b) in self.blocks_mut().zip(other.blocks()) {
             let w = op(*a, b);
             if *a != w {
                 changed = true;
@@ -193,22 +195,27 @@ impl Bitv {
         changed
     }
 
-    #[inline]
-    fn mask_words<'a>(&'a self, mut start: uint) -> MaskWords<'a> {
-        if start > self.storage.len() {
-            start = self.storage.len();
-        }
-        let mut iter = self.storage[start..].iter();
-        MaskWords {
-          next_word: iter.next(),
-          iter: iter,
-          last_word_mask: {
-              let rem = self.nbits % u32::BITS;
-              if rem > 0 {
-                  (1 << rem) - 1
-              } else { !0 }
-          },
-          offset: start
+    /// Iterator over mutable refs to  the underlying blocks of data.
+    fn blocks_mut(&mut self) -> Take<MutItems<u32>> {
+        let blocks = blocks_for_bits(self.len());
+        self.storage.iter_mut().take(blocks)
+    }
+
+    /// Iterator over the underlying blocks of data
+    fn blocks(&self) -> Take<Cloned<Items<u32>>> {
+        let blocks = blocks_for_bits(self.len());
+        self.storage.iter().cloned().take(blocks)
+    }
+
+    /// An operation might screw up the unused bits in the last block of the Bitv.
+    /// It's assumed to be all 0's. This fixes it up.
+    fn fix_last_block(&mut self) {
+        let len = self.len();
+        let extra_bits = len % u32::BITS;
+        if extra_bits > 0 {
+            let mask = (1 << extra_bits) - 1;
+            let storage_len = self.storage.len();
+            self.storage[storage_len - 1] &= mask;
         }
     }
 
@@ -226,33 +233,84 @@ impl Bitv {
     }
 
     /// Creates a `Bitv` that holds `nbits` elements, setting each element
-    /// to `init`.
+    /// to `bit`.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::collections::Bitv;
     ///
-    /// let mut bv = Bitv::with_capacity(10u, false);
+    /// let mut bv = Bitv::from_elem(10u, false);
     /// assert_eq!(bv.len(), 10u);
     /// for x in bv.iter() {
     ///     assert_eq!(x, false);
     /// }
     /// ```
-    pub fn with_capacity(nbits: uint, init: bool) -> Bitv {
+    pub fn from_elem(nbits: uint, bit: bool) -> Bitv {
+        let nblocks = blocks_for_bits(nbits);
         let mut bitv = Bitv {
-            storage: Vec::from_elem((nbits + u32::BITS - 1) / u32::BITS,
-                                    if init { !0u32 } else { 0u32 }),
+            storage: Vec::from_elem(nblocks, if bit { !0u32 } else { 0u32 }),
             nbits: nbits
         };
 
-        // Zero out any unused bits in the highest word if necessary
-        let used_bits = bitv.nbits % u32::BITS;
-        if init && used_bits != 0 {
-            let largest_used_word = (bitv.nbits + u32::BITS - 1) / u32::BITS - 1;
-            bitv.storage[largest_used_word] &= (1 << used_bits) - 1;
-        }
+        bitv.fix_last_block();
+        bitv
+    }
 
+    /// Constructs a new, empty `Bitv` with the specified capacity.
+    ///
+    /// The bitvector will be able to hold exactly `capacity` bits without
+    /// reallocating. If `capacity` is 0, it will not allocate.
+    ///
+    /// It is important to note that this function does not specify the
+    /// *length* of the returned bitvector, but only the *capacity*.
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
+    pub fn with_capacity(nbits: uint) -> Bitv {
+        Bitv {
+            storage: Vec::with_capacity(blocks_for_bits(nbits)),
+            nbits: 0,
+        }
+    }
+
+    /// Transforms a byte-vector into a `Bitv`. Each byte becomes eight bits,
+    /// with the most significant bits of each byte coming first. Each
+    /// bit becomes `true` if equal to 1 or `false` if equal to 0.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::Bitv;
+    ///
+    /// let bv = Bitv::from_bytes(&[0b10100000, 0b00010010]);
+    /// assert!(bv.eq_vec(&[true, false, true, false,
+    ///                     false, false, false, false,
+    ///                     false, false, false, true,
+    ///                     false, false, true, false]));
+    /// ```
+    pub fn from_bytes(bytes: &[u8]) -> Bitv {
+        Bitv::from_fn(bytes.len() * 8, |i| {
+            let b = bytes[i / 8] as u32;
+            let offset = i % 8;
+            b >> (7 - offset) & 1 == 1
+        })
+    }
+
+    /// Creates a `Bitv` of the specified length where the value at each
+    /// index is `f(index)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::Bitv;
+    ///
+    /// let bv = Bitv::from_fn(5, |i| { i % 2 == 0 });
+    /// assert!(bv.eq_vec(&[true, false, true, false, true]));
+    /// ```
+    pub fn from_fn(len: uint, f: |index: uint| -> bool) -> Bitv {
+        let mut bitv = Bitv::from_elem(len, false);
+        for i in range(0u, len) {
+            bitv.set(i, f(i));
+        }
         bitv
     }
 
@@ -265,9 +323,9 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
-    /// let bv = bitv::from_bytes(&[0b01100000]);
+    /// let bv = Bitv::from_bytes(&[0b01100000]);
     /// assert_eq!(bv.get(0), false);
     /// assert_eq!(bv.get(1), true);
     ///
@@ -275,6 +333,7 @@ impl Bitv {
     /// assert_eq!(bv[1], true);
     /// ```
     #[inline]
+    #[unstable = "panic semantics are likely to change in the future"]
     pub fn get(&self, i: uint) -> bool {
         assert!(i < self.nbits);
         let w = i / u32::BITS;
@@ -294,11 +353,12 @@ impl Bitv {
     /// ```
     /// use std::collections::Bitv;
     ///
-    /// let mut bv = Bitv::with_capacity(5, false);
+    /// let mut bv = Bitv::from_elem(5, false);
     /// bv.set(3, true);
     /// assert_eq!(bv[3], true);
     /// ```
     #[inline]
+    #[unstable = "panic semantics are likely to change in the future"]
     pub fn set(&mut self, i: uint, x: bool) {
         assert!(i < self.nbits);
         let w = i / u32::BITS;
@@ -314,18 +374,19 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
     /// let before = 0b01100000;
     /// let after  = 0b11111111;
     ///
-    /// let mut bv = bitv::from_bytes(&[before]);
+    /// let mut bv = Bitv::from_bytes(&[before]);
     /// bv.set_all();
-    /// assert_eq!(bv, bitv::from_bytes(&[after]));
+    /// assert_eq!(bv, Bitv::from_bytes(&[after]));
     /// ```
     #[inline]
     pub fn set_all(&mut self) {
         for w in self.storage.iter_mut() { *w = !0u32; }
+        self.fix_last_block();
     }
 
     /// Flips all bits.
@@ -333,18 +394,19 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
     /// let before = 0b01100000;
     /// let after  = 0b10011111;
     ///
-    /// let mut bv = bitv::from_bytes(&[before]);
+    /// let mut bv = Bitv::from_bytes(&[before]);
     /// bv.negate();
-    /// assert_eq!(bv, bitv::from_bytes(&[after]));
+    /// assert_eq!(bv, Bitv::from_bytes(&[after]));
     /// ```
     #[inline]
     pub fn negate(&mut self) {
         for w in self.storage.iter_mut() { *w = !*w; }
+        self.fix_last_block();
     }
 
     /// Calculates the union of two bitvectors. This acts like the bitwise `or`
@@ -360,17 +422,17 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
     /// let a   = 0b01100100;
     /// let b   = 0b01011010;
     /// let res = 0b01111110;
     ///
-    /// let mut a = bitv::from_bytes(&[a]);
-    /// let b = bitv::from_bytes(&[b]);
+    /// let mut a = Bitv::from_bytes(&[a]);
+    /// let b = Bitv::from_bytes(&[b]);
     ///
     /// assert!(a.union(&b));
-    /// assert_eq!(a, bitv::from_bytes(&[res]));
+    /// assert_eq!(a, Bitv::from_bytes(&[res]));
     /// ```
     #[inline]
     pub fn union(&mut self, other: &Bitv) -> bool {
@@ -390,17 +452,17 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
     /// let a   = 0b01100100;
     /// let b   = 0b01011010;
     /// let res = 0b01000000;
     ///
-    /// let mut a = bitv::from_bytes(&[a]);
-    /// let b = bitv::from_bytes(&[b]);
+    /// let mut a = Bitv::from_bytes(&[a]);
+    /// let b = Bitv::from_bytes(&[b]);
     ///
     /// assert!(a.intersect(&b));
-    /// assert_eq!(a, bitv::from_bytes(&[res]));
+    /// assert_eq!(a, Bitv::from_bytes(&[res]));
     /// ```
     #[inline]
     pub fn intersect(&mut self, other: &Bitv) -> bool {
@@ -420,24 +482,24 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
     /// let a   = 0b01100100;
     /// let b   = 0b01011010;
     /// let a_b = 0b00100100; // a - b
     /// let b_a = 0b00011010; // b - a
     ///
-    /// let mut bva = bitv::from_bytes(&[a]);
-    /// let bvb = bitv::from_bytes(&[b]);
+    /// let mut bva = Bitv::from_bytes(&[a]);
+    /// let bvb = Bitv::from_bytes(&[b]);
     ///
     /// assert!(bva.difference(&bvb));
-    /// assert_eq!(bva, bitv::from_bytes(&[a_b]));
+    /// assert_eq!(bva, Bitv::from_bytes(&[a_b]));
     ///
-    /// let bva = bitv::from_bytes(&[a]);
-    /// let mut bvb = bitv::from_bytes(&[b]);
+    /// let bva = Bitv::from_bytes(&[a]);
+    /// let mut bvb = Bitv::from_bytes(&[b]);
     ///
     /// assert!(bvb.difference(&bva));
-    /// assert_eq!(bvb, bitv::from_bytes(&[b_a]));
+    /// assert_eq!(bvb, Bitv::from_bytes(&[b_a]));
     /// ```
     #[inline]
     pub fn difference(&mut self, other: &Bitv) -> bool {
@@ -451,20 +513,21 @@ impl Bitv {
     /// ```
     /// use std::collections::Bitv;
     ///
-    /// let mut bv = Bitv::with_capacity(5, true);
+    /// let mut bv = Bitv::from_elem(5, true);
     /// assert_eq!(bv.all(), true);
     ///
     /// bv.set(1, false);
     /// assert_eq!(bv.all(), false);
     /// ```
-    #[inline]
     pub fn all(&self) -> bool {
         let mut last_word = !0u32;
-        // Check that every word but the last is all-ones...
-        self.mask_words(0).all(|(_, elem)|
-            { let tmp = last_word; last_word = elem; tmp == !0u32 }) &&
-        // ...and that the last word is ones as far as it needs to be
-        (last_word == ((1 << self.nbits % u32::BITS) - 1) || last_word == !0u32)
+        // Check that every block but the last is all-ones...
+        self.blocks().all(|elem| {
+            let tmp = last_word;
+            last_word = elem;
+            tmp == !0u32
+        // and then check the last one has enough ones
+        }) && (last_word == ((1 << self.nbits % u32::BITS) - 1) || last_word == !0u32)
     }
 
     /// Returns an iterator over the elements of the vector in order.
@@ -472,12 +535,13 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
-    /// let bv = bitv::from_bytes(&[0b01110100, 0b10010010]);
+    /// let bv = Bitv::from_bytes(&[0b01110100, 0b10010010]);
     /// assert_eq!(bv.iter().filter(|x| *x).count(), 7);
     /// ```
     #[inline]
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn iter<'a>(&'a self) -> Bits<'a> {
         Bits {bitv: self, next_idx: 0, end_idx: self.nbits}
     }
@@ -489,14 +553,14 @@ impl Bitv {
     /// ```
     /// use std::collections::Bitv;
     ///
-    /// let mut bv = Bitv::with_capacity(10, false);
+    /// let mut bv = Bitv::from_elem(10, false);
     /// assert_eq!(bv.none(), true);
     ///
     /// bv.set(3, true);
     /// assert_eq!(bv.none(), false);
     /// ```
     pub fn none(&self) -> bool {
-        self.mask_words(0).all(|(_, w)| w == 0)
+        self.blocks().all(|w| w == 0)
     }
 
     /// Returns `true` if any bit is 1.
@@ -506,7 +570,7 @@ impl Bitv {
     /// ```
     /// use std::collections::Bitv;
     ///
-    /// let mut bv = Bitv::with_capacity(10, false);
+    /// let mut bv = Bitv::from_elem(10, false);
     /// assert_eq!(bv.any(), false);
     ///
     /// bv.set(3, true);
@@ -527,12 +591,12 @@ impl Bitv {
     /// ```
     /// use std::collections::Bitv;
     ///
-    /// let mut bv = Bitv::with_capacity(3, true);
+    /// let mut bv = Bitv::from_elem(3, true);
     /// bv.set(1, false);
     ///
     /// assert_eq!(bv.to_bytes(), vec!(0b10100000));
     ///
-    /// let mut bv = Bitv::with_capacity(9, false);
+    /// let mut bv = Bitv::from_elem(9, false);
     /// bv.set(2, true);
     /// bv.set(8, true);
     ///
@@ -562,17 +626,8 @@ impl Bitv {
         )
     }
 
-    /// Transforms `self` into a `Vec<bool>` by turning each bit into a `bool`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::collections::bitv;
-    ///
-    /// let bv = bitv::from_bytes(&[0b10100000]);
-    /// assert_eq!(bv.to_bools(), vec!(true, false, true, false,
-    ///                                false, false, false, false));
-    /// ```
+    /// Deprecated: Use `iter().collect()`.
+    #[deprecated = "Use `iter().collect()`"]
     pub fn to_bools(&self) -> Vec<bool> {
         Vec::from_fn(self.nbits, |i| self.get(i))
     }
@@ -587,9 +642,9 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
-    /// let bv = bitv::from_bytes(&[0b10100000]);
+    /// let bv = Bitv::from_bytes(&[0b10100000]);
     ///
     /// assert!(bv.eq_vec(&[true, false, true, false,
     ///                     false, false, false, false]));
@@ -612,9 +667,9 @@ impl Bitv {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
-    /// let mut bv = bitv::from_bytes(&[0b01001011]);
+    /// let mut bv = Bitv::from_bytes(&[0b01001011]);
     /// bv.truncate(2);
     /// assert!(bv.eq_vec(&[false, true]));
     /// ```
@@ -622,32 +677,72 @@ impl Bitv {
     pub fn truncate(&mut self, len: uint) {
         if len < self.len() {
             self.nbits = len;
-            let word_len = (len + u32::BITS - 1) / u32::BITS;
-            self.storage.truncate(word_len);
-            if len % u32::BITS > 0 {
-                let mask = (1 << len % u32::BITS) - 1;
-                self.storage[word_len - 1] &= mask;
-            }
+            self.storage.truncate(blocks_for_bits(len));
+            self.fix_last_block();
         }
     }
 
-    /// Grows the vector to be able to store `size` bits without resizing.
+    /// Reserves capacity for at least `additional` more bits to be inserted in the given
+    /// `Bitv`. The collection may reserve more space to avoid frequent reallocations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity overflows `uint`.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::collections::Bitv;
     ///
-    /// let mut bv = Bitv::with_capacity(3, false);
+    /// let mut bv = Bitv::from_elem(3, false);
     /// bv.reserve(10);
     /// assert_eq!(bv.len(), 3);
-    /// assert!(bv.capacity() >= 10);
+    /// assert!(bv.capacity() >= 13);
     /// ```
-    pub fn reserve(&mut self, size: uint) {
-        let old_size = self.storage.len();
-        let new_size = (size + u32::BITS - 1) / u32::BITS;
-        if old_size < new_size {
-            self.storage.grow(new_size - old_size, 0);
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
+    pub fn reserve(&mut self, additional: uint) {
+        let desired_cap = self.len().checked_add(additional).expect("capacity overflow");
+        match self.storage.len().checked_mul(u32::BITS) {
+            None => {} // Vec has more initialized capacity than we can ever use
+            Some(initialized_cap) => {
+                if desired_cap > initialized_cap {
+                    self.storage.reserve(blocks_for_bits(desired_cap - initialized_cap));
+                }
+            }
+        }
+    }
+
+    /// Reserves the minimum capacity for exactly `additional` more bits to be inserted in the
+    /// given `Bitv`. Does nothing if the capacity is already sufficient.
+    ///
+    /// Note that the allocator may give the collection more space than it requests. Therefore
+    /// capacity can not be relied upon to be precisely minimal. Prefer `reserve` if future
+    /// insertions are expected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity overflows `uint`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::Bitv;
+    ///
+    /// let mut bv = Bitv::from_elem(3, false);
+    /// bv.reserve(10);
+    /// assert_eq!(bv.len(), 3);
+    /// assert!(bv.capacity() >= 13);
+    /// ```
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
+    pub fn reserve_exact(&mut self, additional: uint) {
+        let desired_cap = self.len().checked_add(additional).expect("capacity overflow");
+        match self.storage.len().checked_mul(u32::BITS) {
+            None => {} // Vec has more initialized capacity than we can ever use
+            Some(initialized_cap) => {
+                if desired_cap > initialized_cap {
+                    self.storage.reserve_exact(blocks_for_bits(desired_cap - initialized_cap));
+                }
+            }
         }
     }
 
@@ -664,83 +759,91 @@ impl Bitv {
     /// assert!(bv.capacity() >= 10);
     /// ```
     #[inline]
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn capacity(&self) -> uint {
-        self.storage.len() * u32::BITS
+        self.storage.capacity().checked_mul(u32::BITS).unwrap_or(uint::MAX)
     }
 
     /// Grows the `Bitv` in-place, adding `n` copies of `value` to the `Bitv`.
     ///
+    /// # Panics
+    ///
+    /// Panics if the new len overflows a `uint`.
+    ///
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
-    /// let mut bv = bitv::from_bytes(&[0b01001011]);
+    /// let mut bv = Bitv::from_bytes(&[0b01001011]);
     /// bv.grow(2, true);
     /// assert_eq!(bv.len(), 10);
     /// assert_eq!(bv.to_bytes(), vec!(0b01001011, 0b11000000));
     /// ```
     pub fn grow(&mut self, n: uint, value: bool) {
-        let new_nbits = self.nbits + n;
-        let new_nwords = (new_nbits + u32::BITS - 1) / u32::BITS;
+        // Note: we just bulk set all the bits in the last word in this fn in multiple places
+        // which is technically wrong if not all of these bits are to be used. However, at the end
+        // of this fn we call `fix_last_block` at the end of this fn, which should fix this.
+
+        let new_nbits = self.nbits.checked_add(n).expect("capacity overflow");
+        let new_nblocks = blocks_for_bits(new_nbits);
         let full_value = if value { !0 } else { 0 };
+
         // Correct the old tail word
-        let old_last_word = (self.nbits + u32::BITS - 1) / u32::BITS - 1;
+        let old_last_word = blocks_for_bits(self.nbits) - 1;
         if self.nbits % u32::BITS > 0 {
             let overhang = self.nbits % u32::BITS; // # of already-used bits
-            let mask = !((1 << overhang) - 1);  // e.g. 5 unused bits => 111110....0
+            let mask = !((1 << overhang) - 1);  // e.g. 5 unused bits => 111110..0
             if value {
                 self.storage[old_last_word] |= mask;
             } else {
                 self.storage[old_last_word] &= !mask;
             }
         }
+
         // Fill in words after the old tail word
-        let stop_idx = cmp::min(self.storage.len(), new_nwords);
+        let stop_idx = cmp::min(self.storage.len(), new_nblocks);
         for idx in range(old_last_word + 1, stop_idx) {
             self.storage[idx] = full_value;
         }
-        // Allocate new words, if needed
-        if new_nwords > self.storage.len() {
-            let to_add = new_nwords - self.storage.len();
-            self.storage.grow(to_add, full_value);
 
-            // Zero out and unused bits in the new tail word
-            if value {
-                let tail_word = new_nwords - 1;
-                let used_bits = new_nbits % u32::BITS;
-                self.storage[tail_word] &= (1 << used_bits) - 1;
-            }
+        // Allocate new words, if needed
+        if new_nblocks > self.storage.len() {
+            let to_add = new_nblocks - self.storage.len();
+            self.storage.grow(to_add, full_value);
         }
+
         // Adjust internal bit count
         self.nbits = new_nbits;
+
+        self.fix_last_block();
     }
 
-    /// Shortens by one element and returns the removed element.
-    ///
-    /// # Panics
-    ///
-    /// Assert if empty.
+    /// Removes the last bit from the Bitv, and returns it. Returns None if the Bitv is empty.
     ///
     /// # Examples
     ///
     /// ```
-    /// use std::collections::bitv;
+    /// use std::collections::Bitv;
     ///
-    /// let mut bv = bitv::from_bytes(&[0b01001001]);
-    /// assert_eq!(bv.pop(), true);
-    /// assert_eq!(bv.pop(), false);
+    /// let mut bv = Bitv::from_bytes(&[0b01001001]);
+    /// assert_eq!(bv.pop(), Some(true));
+    /// assert_eq!(bv.pop(), Some(false));
     /// assert_eq!(bv.len(), 6);
-    /// assert_eq!(bv.to_bytes(), vec!(0b01001000));
     /// ```
-    pub fn pop(&mut self) -> bool {
-        let ret = self.get(self.nbits - 1);
-        // If we are unusing a whole word, make sure it is zeroed out
-        if self.nbits % u32::BITS == 1 {
-            self.storage[self.nbits / u32::BITS] = 0;
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
+    pub fn pop(&mut self) -> Option<bool> {
+        if self.is_empty() {
+            None
+        } else {
+            let ret = self.get(self.nbits - 1);
+            // If we are unusing a whole word, make sure it is zeroed out
+            self.nbits -= 1;
+            if self.nbits % u32::BITS == 0 {
+                self.storage[self.nbits / u32::BITS] = 0;
+            }
+            Some(ret)
         }
-        self.nbits -= 1;
-        ret
     }
 
     /// Pushes a `bool` onto the end.
@@ -755,10 +858,11 @@ impl Bitv {
     /// bv.push(false);
     /// assert!(bv.eq_vec(&[true, false]));
     /// ```
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn push(&mut self, elem: bool) {
         let insert_pos = self.nbits;
-        self.nbits += 1;
-        if self.storage.len() * u32::BITS < self.nbits {
+        self.nbits = self.nbits.checked_add(1).expect("Capacity overflow");
+        if self.storage.len().checked_mul(u32::BITS).unwrap_or(uint::MAX) < self.nbits {
             self.storage.push(0);
         }
         self.set(insert_pos, elem);
@@ -782,46 +886,16 @@ impl Bitv {
     }
 }
 
-/// Transforms a byte-vector into a `Bitv`. Each byte becomes eight bits,
-/// with the most significant bits of each byte coming first. Each
-/// bit becomes `true` if equal to 1 or `false` if equal to 0.
-///
-/// # Examples
-///
-/// ```
-/// use std::collections::bitv;
-///
-/// let bv = bitv::from_bytes(&[0b10100000, 0b00010010]);
-/// assert!(bv.eq_vec(&[true, false, true, false,
-///                     false, false, false, false,
-///                     false, false, false, true,
-///                     false, false, true, false]));
-/// ```
+/// Deprecated: Now a static method on Bitv.
+#[deprecated = "Now a static method on Bitv"]
 pub fn from_bytes(bytes: &[u8]) -> Bitv {
-    from_fn(bytes.len() * 8, |i| {
-        let b = bytes[i / 8] as u32;
-        let offset = i % 8;
-        b >> (7 - offset) & 1 == 1
-    })
+    Bitv::from_bytes(bytes)
 }
 
-/// Creates a `Bitv` of the specified length where the value at each
-/// index is `f(index)`.
-///
-/// # Examples
-///
-/// ```
-/// use std::collections::bitv::from_fn;
-///
-/// let bv = from_fn(5, |i| { i % 2 == 0 });
-/// assert!(bv.eq_vec(&[true, false, true, false, true]));
-/// ```
+/// Deprecated: Now a static method on Bitv.
+#[deprecated = "Now a static method on Bitv"]
 pub fn from_fn(len: uint, f: |index: uint| -> bool) -> Bitv {
-    let mut bitv = Bitv::with_capacity(len, false);
-    for i in range(0u, len) {
-        bitv.set(i, f(i));
-    }
-    bitv
+    Bitv::from_fn(len, f)
 }
 
 impl Default for Bitv {
@@ -841,8 +915,7 @@ impl Extend<bool> for Bitv {
     #[inline]
     fn extend<I: Iterator<bool>>(&mut self, mut iterator: I) {
         let (min, _) = iterator.size_hint();
-        let nbits = self.nbits;
-        self.reserve(nbits + min);
+        self.reserve(min);
         for element in iterator {
             self.push(element)
         }
@@ -888,7 +961,7 @@ impl fmt::Show for Bitv {
 impl<S: hash::Writer> hash::Hash<S> for Bitv {
     fn hash(&self, state: &mut S) {
         self.nbits.hash(state);
-        for (_, elem) in self.mask_words(0) {
+        for elem in self.blocks() {
             elem.hash(state);
         }
     }
@@ -900,7 +973,7 @@ impl cmp::PartialEq for Bitv {
         if self.nbits != other.nbits {
             return false;
         }
-        self.mask_words(0).zip(other.mask_words(0)).all(|((_, w1), (_, w2))| w1 == w2)
+        self.blocks().zip(other.blocks()).all(|(w1, w2)| w1 == w2)
     }
 }
 
@@ -972,7 +1045,6 @@ impl<'a> RandomAccessIterator<bool> for Bits<'a> {
 ///
 /// ```
 /// use std::collections::{BitvSet, Bitv};
-/// use std::collections::bitv;
 ///
 /// // It's a regular set
 /// let mut s = BitvSet::new();
@@ -987,7 +1059,7 @@ impl<'a> RandomAccessIterator<bool> for Bits<'a> {
 /// }
 ///
 /// // Can initialize from a `Bitv`
-/// let other = BitvSet::from_bitv(bitv::from_bytes(&[0b11010000]));
+/// let other = BitvSet::from_bitv(Bitv::from_bytes(&[0b11010000]));
 ///
 /// s.union_with(&other);
 ///
@@ -1001,7 +1073,9 @@ impl<'a> RandomAccessIterator<bool> for Bits<'a> {
 /// assert!(bv.get(3));
 /// ```
 #[deriving(Clone)]
-pub struct BitvSet(Bitv);
+pub struct BitvSet {
+    bitv: Bitv,
+}
 
 impl Default for BitvSet {
     #[inline]
@@ -1019,8 +1093,7 @@ impl FromIterator<bool> for BitvSet {
 impl Extend<bool> for BitvSet {
     #[inline]
     fn extend<I: Iterator<bool>>(&mut self, iterator: I) {
-        let &BitvSet(ref mut self_bitv) = self;
-        self_bitv.extend(iterator);
+        self.bitv.extend(iterator);
     }
 }
 
@@ -1051,45 +1124,47 @@ impl cmp::PartialEq for BitvSet {
 impl cmp::Eq for BitvSet {}
 
 impl BitvSet {
-    /// Creates a new bit vector set with initially no contents.
+    /// Creates a new empty `BitvSet`.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::collections::BitvSet;
+    ///
     /// let mut s = BitvSet::new();
     /// ```
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn new() -> BitvSet {
-        BitvSet(Bitv::new())
+        BitvSet { bitv: Bitv::new() }
     }
 
-    /// Creates a new bit vector set with initially no contents, able to
+    /// Creates a new `BitvSet` with initially no contents, able to
     /// hold `nbits` elements without resizing.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::collections::BitvSet;
+    ///
     /// let mut s = BitvSet::with_capacity(100);
     /// assert!(s.capacity() >= 100);
     /// ```
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn with_capacity(nbits: uint) -> BitvSet {
-        let bitv = Bitv::with_capacity(nbits, false);
+        let bitv = Bitv::from_elem(nbits, false);
         BitvSet::from_bitv(bitv)
     }
 
-    /// Creates a new bit vector set from the given bit vector.
+    /// Creates a new `BitvSet` from the given bit vector.
     ///
     /// # Examples
     ///
     /// ```
-    /// use std::collections::{bitv, BitvSet};
+    /// use std::collections::{Bitv, BitvSet};
     ///
-    /// let bv = bitv::from_bytes(&[0b01100000]);
+    /// let bv = Bitv::from_bytes(&[0b01100000]);
     /// let s = BitvSet::from_bitv(bv);
     ///
     /// // Print 1, 2 in arbitrary order
@@ -1098,10 +1173,8 @@ impl BitvSet {
     /// }
     /// ```
     #[inline]
-    pub fn from_bitv(mut bitv: Bitv) -> BitvSet {
-        // Mark every bit as valid
-        bitv.nbits = bitv.capacity();
-        BitvSet(bitv)
+    pub fn from_bitv(bitv: Bitv) -> BitvSet {
+        BitvSet { bitv: bitv }
     }
 
     /// Returns the capacity in bits for this bit vector. Inserting any
@@ -1118,11 +1191,15 @@ impl BitvSet {
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn capacity(&self) -> uint {
-        let &BitvSet(ref bitv) = self;
-        bitv.capacity()
+        self.bitv.capacity()
     }
 
-    /// Grows the underlying vector to be able to store `size` bits.
+    /// Reserves capacity for an element to be inserted at `index` in the given
+    /// `Bitv`. The collection may reserve more space to avoid frequent reallocations.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity overflows `uint`.
     ///
     /// # Examples
     ///
@@ -1130,16 +1207,45 @@ impl BitvSet {
     /// use std::collections::BitvSet;
     ///
     /// let mut s = BitvSet::new();
-    /// s.reserve(10);
-    /// assert!(s.capacity() >= 10);
+    /// s.reserve_index(10);
+    /// assert!(s.capacity() >= 11);
     /// ```
-    pub fn reserve(&mut self, size: uint) {
-        let &BitvSet(ref mut bitv) = self;
-        bitv.reserve(size);
-        if bitv.nbits < size {
-            bitv.nbits = bitv.capacity();
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
+    pub fn reserve_index(&mut self, index: uint) {
+        let len = self.bitv.len();
+        if index >= len {
+            self.bitv.reserve(index - len + 1);
         }
     }
+
+    /// Reserves the minimum capacity for an element to be inserted at `index`
+    /// in the given `BitvSet`. Does nothing if the capacity is already sufficient.
+    ///
+    /// Note that the allocator may give the collection more space than it requests. Therefore
+    /// capacity can not be relied upon to be precisely minimal. Prefer `reserve_index` if future
+    /// insertions are expected.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity overflows `uint`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::BitvSet;
+    ///
+    /// let mut s = BitvSet::new();
+    /// s.reserve_index_exact(10);
+    /// assert!(s.capacity() >= 11);
+    /// ```
+    #[unstable = "matches collection reform specification, waiting for dust to settle"]
+    pub fn reserve_index_exact(&mut self, index: uint) {
+        let len = self.bitv.len();
+        if index >= len {
+            self.bitv.reserve_exact(index - len + 1);
+        }
+    }
+
 
     /// Consumes this set to return the underlying bit vector.
     ///
@@ -1158,8 +1264,7 @@ impl BitvSet {
     /// ```
     #[inline]
     pub fn into_bitv(self) -> Bitv {
-        let BitvSet(bitv) = self;
-        bitv
+        self.bitv
     }
 
     /// Returns a reference to the underlying bit vector.
@@ -1177,18 +1282,22 @@ impl BitvSet {
     /// ```
     #[inline]
     pub fn get_ref<'a>(&'a self) -> &'a Bitv {
-        let &BitvSet(ref bitv) = self;
-        bitv
+        &self.bitv
     }
 
     #[inline]
     fn other_op(&mut self, other: &BitvSet, f: |u32, u32| -> u32) {
-        // Expand the vector if necessary
-        self.reserve(other.capacity());
-
         // Unwrap Bitvs
-        let &BitvSet(ref mut self_bitv) = self;
-        let &BitvSet(ref other_bitv) = other;
+        let self_bitv = &mut self.bitv;
+        let other_bitv = &other.bitv;
+
+        let self_len = self_bitv.len();
+        let other_len = other_bitv.len();
+
+        // Expand the vector if necessary
+        if self_len < other_len {
+            self_bitv.grow(other_len - self_len, false);
+        }
 
         // virtually pad other with 0's for equal lengths
         let mut other_words = {
@@ -1225,7 +1334,7 @@ impl BitvSet {
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn shrink_to_fit(&mut self) {
-        let &BitvSet(ref mut bitv) = self;
+        let bitv = &mut self.bitv;
         // Obtain original length
         let old_len = bitv.storage.len();
         // Obtain coarse trailing zero length
@@ -1241,10 +1350,9 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{Bitv, BitvSet};
     ///
-    /// let s = BitvSet::from_bitv(bitv::from_bytes(&[0b01001010]));
+    /// let s = BitvSet::from_bitv(Bitv::from_bytes(&[0b01001010]));
     ///
     /// // Print 1, 4, 6 in arbitrary order
     /// for x in s.iter() {
@@ -1263,11 +1371,10 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{Bitv, BitvSet};
     ///
-    /// let a = BitvSet::from_bitv(bitv::from_bytes(&[0b01101000]));
-    /// let b = BitvSet::from_bitv(bitv::from_bytes(&[0b10100000]));
+    /// let a = BitvSet::from_bitv(Bitv::from_bytes(&[0b01101000]));
+    /// let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100000]));
     ///
     /// // Print 0, 1, 2, 4 in arbitrary order
     /// for x in a.union(&b) {
@@ -1292,11 +1399,10 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{Bitv, BitvSet};
     ///
-    /// let a = BitvSet::from_bitv(bitv::from_bytes(&[0b01101000]));
-    /// let b = BitvSet::from_bitv(bitv::from_bytes(&[0b10100000]));
+    /// let a = BitvSet::from_bitv(Bitv::from_bytes(&[0b01101000]));
+    /// let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100000]));
     ///
     /// // Print 2
     /// for x in a.intersection(&b) {
@@ -1306,7 +1412,7 @@ impl BitvSet {
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn intersection<'a>(&'a self, other: &'a BitvSet) -> Take<TwoBitPositions<'a>> {
-        let min = cmp::min(self.capacity(), other.capacity());
+        let min = cmp::min(self.bitv.len(), other.bitv.len());
         TwoBitPositions {
             set: self,
             other: other,
@@ -1322,11 +1428,10 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{BitvSet, Bitv};
     ///
-    /// let a = BitvSet::from_bitv(bitv::from_bytes(&[0b01101000]));
-    /// let b = BitvSet::from_bitv(bitv::from_bytes(&[0b10100000]));
+    /// let a = BitvSet::from_bitv(Bitv::from_bytes(&[0b01101000]));
+    /// let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100000]));
     ///
     /// // Print 1, 4 in arbitrary order
     /// for x in a.difference(&b) {
@@ -1359,11 +1464,10 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{BitvSet, Bitv};
     ///
-    /// let a = BitvSet::from_bitv(bitv::from_bytes(&[0b01101000]));
-    /// let b = BitvSet::from_bitv(bitv::from_bytes(&[0b10100000]));
+    /// let a = BitvSet::from_bitv(Bitv::from_bytes(&[0b01101000]));
+    /// let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100000]));
     ///
     /// // Print 0, 1, 4 in arbitrary order
     /// for x in a.symmetric_difference(&b) {
@@ -1387,16 +1491,15 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{BitvSet, Bitv};
     ///
     /// let a   = 0b01101000;
     /// let b   = 0b10100000;
     /// let res = 0b11101000;
     ///
-    /// let mut a = BitvSet::from_bitv(bitv::from_bytes(&[a]));
-    /// let b = BitvSet::from_bitv(bitv::from_bytes(&[b]));
-    /// let res = BitvSet::from_bitv(bitv::from_bytes(&[res]));
+    /// let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[a]));
+    /// let b = BitvSet::from_bitv(Bitv::from_bytes(&[b]));
+    /// let res = BitvSet::from_bitv(Bitv::from_bytes(&[res]));
     ///
     /// a.union_with(&b);
     /// assert_eq!(a, res);
@@ -1411,16 +1514,15 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{BitvSet, Bitv};
     ///
     /// let a   = 0b01101000;
     /// let b   = 0b10100000;
     /// let res = 0b00100000;
     ///
-    /// let mut a = BitvSet::from_bitv(bitv::from_bytes(&[a]));
-    /// let b = BitvSet::from_bitv(bitv::from_bytes(&[b]));
-    /// let res = BitvSet::from_bitv(bitv::from_bytes(&[res]));
+    /// let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[a]));
+    /// let b = BitvSet::from_bitv(Bitv::from_bytes(&[b]));
+    /// let res = BitvSet::from_bitv(Bitv::from_bytes(&[res]));
     ///
     /// a.intersect_with(&b);
     /// assert_eq!(a, res);
@@ -1436,24 +1538,23 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{BitvSet, Bitv};
     ///
     /// let a   = 0b01101000;
     /// let b   = 0b10100000;
     /// let a_b = 0b01001000; // a - b
     /// let b_a = 0b10000000; // b - a
     ///
-    /// let mut bva = BitvSet::from_bitv(bitv::from_bytes(&[a]));
-    /// let bvb = BitvSet::from_bitv(bitv::from_bytes(&[b]));
-    /// let bva_b = BitvSet::from_bitv(bitv::from_bytes(&[a_b]));
-    /// let bvb_a = BitvSet::from_bitv(bitv::from_bytes(&[b_a]));
+    /// let mut bva = BitvSet::from_bitv(Bitv::from_bytes(&[a]));
+    /// let bvb = BitvSet::from_bitv(Bitv::from_bytes(&[b]));
+    /// let bva_b = BitvSet::from_bitv(Bitv::from_bytes(&[a_b]));
+    /// let bvb_a = BitvSet::from_bitv(Bitv::from_bytes(&[b_a]));
     ///
     /// bva.difference_with(&bvb);
     /// assert_eq!(bva, bva_b);
     ///
-    /// let bva = BitvSet::from_bitv(bitv::from_bytes(&[a]));
-    /// let mut bvb = BitvSet::from_bitv(bitv::from_bytes(&[b]));
+    /// let bva = BitvSet::from_bitv(Bitv::from_bytes(&[a]));
+    /// let mut bvb = BitvSet::from_bitv(Bitv::from_bytes(&[b]));
     ///
     /// bvb.difference_with(&bva);
     /// assert_eq!(bvb, bvb_a);
@@ -1469,16 +1570,15 @@ impl BitvSet {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::BitvSet;
-    /// use std::collections::bitv;
+    /// use std::collections::{BitvSet, Bitv};
     ///
     /// let a   = 0b01101000;
     /// let b   = 0b10100000;
     /// let res = 0b11001000;
     ///
-    /// let mut a = BitvSet::from_bitv(bitv::from_bytes(&[a]));
-    /// let b = BitvSet::from_bitv(bitv::from_bytes(&[b]));
-    /// let res = BitvSet::from_bitv(bitv::from_bytes(&[res]));
+    /// let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[a]));
+    /// let b = BitvSet::from_bitv(Bitv::from_bytes(&[b]));
+    /// let res = BitvSet::from_bitv(Bitv::from_bytes(&[res]));
     ///
     /// a.symmetric_difference_with(&b);
     /// assert_eq!(a, res);
@@ -1492,31 +1592,28 @@ impl BitvSet {
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn len(&self) -> uint  {
-        let &BitvSet(ref bitv) = self;
-        bitv.storage.iter().fold(0, |acc, &n| acc + n.count_ones())
+        self.bitv.blocks().fold(0, |acc, n| acc + n.count_ones())
     }
 
     /// Returns whether there are no bits set in this set
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn is_empty(&self) -> bool {
-        let &BitvSet(ref bitv) = self;
-        bitv.storage.iter().all(|&n| n == 0)
+        self.bitv.none()
     }
 
     /// Clears all bits in this set
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn clear(&mut self) {
-        let &BitvSet(ref mut bitv) = self;
-        bitv.clear();
+        self.bitv.clear();
     }
 
     /// Returns `true` if this set contains the specified integer.
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn contains(&self, value: &uint) -> bool {
-        let &BitvSet(ref bitv) = self;
+        let bitv = &self.bitv;
         *value < bitv.nbits && bitv.get(*value)
     }
 
@@ -1532,14 +1629,14 @@ impl BitvSet {
     #[inline]
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn is_subset(&self, other: &BitvSet) -> bool {
-        let &BitvSet(ref self_bitv) = self;
-        let &BitvSet(ref other_bitv) = other;
+        let self_bitv = &self.bitv;
+        let other_bitv = &other.bitv;
+        let other_blocks = blocks_for_bits(other_bitv.len());
 
         // Check that `self` intersect `other` is self
-        self_bitv.mask_words(0).zip(other_bitv.mask_words(0))
-                               .all(|((_, w1), (_, w2))| w1 & w2 == w1) &&
-        // Check that `self` setminus `other` is empty
-        self_bitv.mask_words(other_bitv.storage.len()).all(|(_, w)| w == 0)
+        self_bitv.blocks().zip(other_bitv.blocks()).all(|(w1, w2)| w1 & w2 == w1) &&
+        // Make sure if `self` has any more blocks than `other`, they're all 0
+        self_bitv.blocks().skip(other_blocks).all(|w| w == 0)
     }
 
     /// Returns `true` if the set is a superset of another.
@@ -1558,13 +1655,12 @@ impl BitvSet {
         }
 
         // Ensure we have enough space to hold the new element
-        if value >= self.capacity() {
-            let new_cap = cmp::max(value + 1, self.capacity() * 2);
-            self.reserve(new_cap);
+        let len = self.bitv.len();
+        if value >= len {
+            self.bitv.grow(value - len + 1, false)
         }
 
-        let &BitvSet(ref mut bitv) = self;
-        bitv.set(value, true);
+        self.bitv.set(value, true);
         return true;
     }
 
@@ -1575,8 +1671,9 @@ impl BitvSet {
         if !self.contains(value) {
             return false;
         }
-        let &BitvSet(ref mut bitv) = self;
-        bitv.set(*value, false);
+
+        self.bitv.set(*value, false);
+
         return true;
     }
 }
@@ -1621,7 +1718,7 @@ pub struct TwoBitPositions<'a> {
 
 impl<'a> Iterator<uint> for BitPositions<'a> {
     fn next(&mut self) -> Option<uint> {
-        while self.next_idx < self.set.capacity() {
+        while self.next_idx < self.set.bitv.len() {
             let idx = self.next_idx;
             self.next_idx += 1;
 
@@ -1635,18 +1732,18 @@ impl<'a> Iterator<uint> for BitPositions<'a> {
 
     #[inline]
     fn size_hint(&self) -> (uint, Option<uint>) {
-        (0, Some(self.set.capacity() - self.next_idx))
+        (0, Some(self.set.bitv.len() - self.next_idx))
     }
 }
 
 impl<'a> Iterator<uint> for TwoBitPositions<'a> {
     fn next(&mut self) -> Option<uint> {
-        while self.next_idx < self.set.capacity() ||
-              self.next_idx < self.other.capacity() {
+        while self.next_idx < self.set.bitv.len() ||
+              self.next_idx < self.other.bitv.len() {
             let bit_idx = self.next_idx % u32::BITS;
             if bit_idx == 0 {
-                let &BitvSet(ref s_bitv) = self.set;
-                let &BitvSet(ref o_bitv) = self.other;
+                let s_bitv = &self.set.bitv;
+                let o_bitv = &self.other.bitv;
                 // Merging the two words is a bit of an awkward dance since
                 // one Bitv might be longer than the other
                 let word_idx = self.next_idx / u32::BITS;
@@ -1669,32 +1766,29 @@ impl<'a> Iterator<uint> for TwoBitPositions<'a> {
 
     #[inline]
     fn size_hint(&self) -> (uint, Option<uint>) {
-        let cap = cmp::max(self.set.capacity(), self.other.capacity());
+        let cap = cmp::max(self.set.bitv.len(), self.other.bitv.len());
         (0, Some(cap - self.next_idx))
     }
 }
 
+
+
+
+
 #[cfg(test)]
-mod tests {
+mod bitv_test {
     use std::prelude::*;
-    use std::iter::range_step;
-    use std::rand;
-    use std::rand::Rng;
     use std::u32;
-    use test::{Bencher, black_box};
 
-    use super::{Bitv, BitvSet, from_fn, from_bytes};
-    use bitv;
+    use super::Bitv;
     use vec::Vec;
-
-    static BENCH_BITS : uint = 1 << 14;
 
     #[test]
     fn test_to_str() {
         let zerolen = Bitv::new();
         assert_eq!(zerolen.to_string(), "");
 
-        let eightbits = Bitv::with_capacity(8u, false);
+        let eightbits = Bitv::from_elem(8u, false);
         assert_eq!(eightbits.to_string(), "00000000")
     }
 
@@ -1707,15 +1801,15 @@ mod tests {
 
     #[test]
     fn test_1_element() {
-        let mut act = Bitv::with_capacity(1u, false);
+        let mut act = Bitv::from_elem(1u, false);
         assert!(act.eq_vec(&[false]));
-        act = Bitv::with_capacity(1u, true);
+        act = Bitv::from_elem(1u, true);
         assert!(act.eq_vec(&[true]));
     }
 
     #[test]
     fn test_2_elements() {
-        let mut b = bitv::Bitv::with_capacity(2, false);
+        let mut b = Bitv::from_elem(2, false);
         b.set(0, true);
         b.set(1, false);
         assert_eq!(b.to_string(), "10");
@@ -1726,16 +1820,16 @@ mod tests {
         let mut act;
         // all 0
 
-        act = Bitv::with_capacity(10u, false);
+        act = Bitv::from_elem(10u, false);
         assert!((act.eq_vec(
                     &[false, false, false, false, false, false, false, false, false, false])));
         // all 1
 
-        act = Bitv::with_capacity(10u, true);
+        act = Bitv::from_elem(10u, true);
         assert!((act.eq_vec(&[true, true, true, true, true, true, true, true, true, true])));
         // mixed
 
-        act = Bitv::with_capacity(10u, false);
+        act = Bitv::from_elem(10u, false);
         act.set(0u, true);
         act.set(1u, true);
         act.set(2u, true);
@@ -1744,7 +1838,7 @@ mod tests {
         assert!((act.eq_vec(&[true, true, true, true, true, false, false, false, false, false])));
         // mixed
 
-        act = Bitv::with_capacity(10u, false);
+        act = Bitv::from_elem(10u, false);
         act.set(5u, true);
         act.set(6u, true);
         act.set(7u, true);
@@ -1753,7 +1847,7 @@ mod tests {
         assert!((act.eq_vec(&[false, false, false, false, false, true, true, true, true, true])));
         // mixed
 
-        act = Bitv::with_capacity(10u, false);
+        act = Bitv::from_elem(10u, false);
         act.set(0u, true);
         act.set(3u, true);
         act.set(6u, true);
@@ -1766,21 +1860,21 @@ mod tests {
         let mut act;
         // all 0
 
-        act = Bitv::with_capacity(31u, false);
+        act = Bitv::from_elem(31u, false);
         assert!(act.eq_vec(
                 &[false, false, false, false, false, false, false, false, false, false, false,
                   false, false, false, false, false, false, false, false, false, false, false,
                   false, false, false, false, false, false, false, false, false]));
         // all 1
 
-        act = Bitv::with_capacity(31u, true);
+        act = Bitv::from_elem(31u, true);
         assert!(act.eq_vec(
                 &[true, true, true, true, true, true, true, true, true, true, true, true, true,
                   true, true, true, true, true, true, true, true, true, true, true, true, true,
                   true, true, true, true, true]));
         // mixed
 
-        act = Bitv::with_capacity(31u, false);
+        act = Bitv::from_elem(31u, false);
         act.set(0u, true);
         act.set(1u, true);
         act.set(2u, true);
@@ -1795,7 +1889,7 @@ mod tests {
                   false, false, false, false, false, false, false]));
         // mixed
 
-        act = Bitv::with_capacity(31u, false);
+        act = Bitv::from_elem(31u, false);
         act.set(16u, true);
         act.set(17u, true);
         act.set(18u, true);
@@ -1810,7 +1904,7 @@ mod tests {
                   false, false, false, false, false, false, false]));
         // mixed
 
-        act = Bitv::with_capacity(31u, false);
+        act = Bitv::from_elem(31u, false);
         act.set(24u, true);
         act.set(25u, true);
         act.set(26u, true);
@@ -1824,7 +1918,7 @@ mod tests {
                   false, false, true, true, true, true, true, true, true]));
         // mixed
 
-        act = Bitv::with_capacity(31u, false);
+        act = Bitv::from_elem(31u, false);
         act.set(3u, true);
         act.set(17u, true);
         act.set(30u, true);
@@ -1839,21 +1933,21 @@ mod tests {
         let mut act;
         // all 0
 
-        act = Bitv::with_capacity(32u, false);
+        act = Bitv::from_elem(32u, false);
         assert!(act.eq_vec(
                 &[false, false, false, false, false, false, false, false, false, false, false,
                   false, false, false, false, false, false, false, false, false, false, false,
                   false, false, false, false, false, false, false, false, false, false]));
         // all 1
 
-        act = Bitv::with_capacity(32u, true);
+        act = Bitv::from_elem(32u, true);
         assert!(act.eq_vec(
                 &[true, true, true, true, true, true, true, true, true, true, true, true, true,
                   true, true, true, true, true, true, true, true, true, true, true, true, true,
                   true, true, true, true, true, true]));
         // mixed
 
-        act = Bitv::with_capacity(32u, false);
+        act = Bitv::from_elem(32u, false);
         act.set(0u, true);
         act.set(1u, true);
         act.set(2u, true);
@@ -1868,7 +1962,7 @@ mod tests {
                   false, false, false, false, false, false, false, false]));
         // mixed
 
-        act = Bitv::with_capacity(32u, false);
+        act = Bitv::from_elem(32u, false);
         act.set(16u, true);
         act.set(17u, true);
         act.set(18u, true);
@@ -1883,7 +1977,7 @@ mod tests {
                   false, false, false, false, false, false, false, false]));
         // mixed
 
-        act = Bitv::with_capacity(32u, false);
+        act = Bitv::from_elem(32u, false);
         act.set(24u, true);
         act.set(25u, true);
         act.set(26u, true);
@@ -1898,7 +1992,7 @@ mod tests {
                   false, false, true, true, true, true, true, true, true, true]));
         // mixed
 
-        act = Bitv::with_capacity(32u, false);
+        act = Bitv::from_elem(32u, false);
         act.set(3u, true);
         act.set(17u, true);
         act.set(30u, true);
@@ -1914,21 +2008,21 @@ mod tests {
         let mut act;
         // all 0
 
-        act = Bitv::with_capacity(33u, false);
+        act = Bitv::from_elem(33u, false);
         assert!(act.eq_vec(
                 &[false, false, false, false, false, false, false, false, false, false, false,
                   false, false, false, false, false, false, false, false, false, false, false,
                   false, false, false, false, false, false, false, false, false, false, false]));
         // all 1
 
-        act = Bitv::with_capacity(33u, true);
+        act = Bitv::from_elem(33u, true);
         assert!(act.eq_vec(
                 &[true, true, true, true, true, true, true, true, true, true, true, true, true,
                   true, true, true, true, true, true, true, true, true, true, true, true, true,
                   true, true, true, true, true, true, true]));
         // mixed
 
-        act = Bitv::with_capacity(33u, false);
+        act = Bitv::from_elem(33u, false);
         act.set(0u, true);
         act.set(1u, true);
         act.set(2u, true);
@@ -1943,7 +2037,7 @@ mod tests {
                   false, false, false, false, false, false, false, false, false]));
         // mixed
 
-        act = Bitv::with_capacity(33u, false);
+        act = Bitv::from_elem(33u, false);
         act.set(16u, true);
         act.set(17u, true);
         act.set(18u, true);
@@ -1958,7 +2052,7 @@ mod tests {
                   false, false, false, false, false, false, false, false, false]));
         // mixed
 
-        act = Bitv::with_capacity(33u, false);
+        act = Bitv::from_elem(33u, false);
         act.set(24u, true);
         act.set(25u, true);
         act.set(26u, true);
@@ -1973,7 +2067,7 @@ mod tests {
                   false, false, true, true, true, true, true, true, true, true, false]));
         // mixed
 
-        act = Bitv::with_capacity(33u, false);
+        act = Bitv::from_elem(33u, false);
         act.set(3u, true);
         act.set(17u, true);
         act.set(30u, true);
@@ -1987,24 +2081,24 @@ mod tests {
 
     #[test]
     fn test_equal_differing_sizes() {
-        let v0 = Bitv::with_capacity(10u, false);
-        let v1 = Bitv::with_capacity(11u, false);
+        let v0 = Bitv::from_elem(10u, false);
+        let v1 = Bitv::from_elem(11u, false);
         assert!(v0 != v1);
     }
 
     #[test]
     fn test_equal_greatly_differing_sizes() {
-        let v0 = Bitv::with_capacity(10u, false);
-        let v1 = Bitv::with_capacity(110u, false);
+        let v0 = Bitv::from_elem(10u, false);
+        let v1 = Bitv::from_elem(110u, false);
         assert!(v0 != v1);
     }
 
     #[test]
     fn test_equal_sneaky_small() {
-        let mut a = bitv::Bitv::with_capacity(1, false);
+        let mut a = Bitv::from_elem(1, false);
         a.set(0, true);
 
-        let mut b = bitv::Bitv::with_capacity(1, true);
+        let mut b = Bitv::from_elem(1, true);
         b.set(0, true);
 
         assert_eq!(a, b);
@@ -2012,12 +2106,12 @@ mod tests {
 
     #[test]
     fn test_equal_sneaky_big() {
-        let mut a = bitv::Bitv::with_capacity(100, false);
+        let mut a = Bitv::from_elem(100, false);
         for i in range(0u, 100) {
             a.set(i, true);
         }
 
-        let mut b = bitv::Bitv::with_capacity(100, true);
+        let mut b = Bitv::from_elem(100, true);
         for i in range(0u, 100) {
             b.set(i, true);
         }
@@ -2027,18 +2121,18 @@ mod tests {
 
     #[test]
     fn test_from_bytes() {
-        let bitv = from_bytes(&[0b10110110, 0b00000000, 0b11111111]);
+        let bitv = Bitv::from_bytes(&[0b10110110, 0b00000000, 0b11111111]);
         let str = format!("{}{}{}", "10110110", "00000000", "11111111");
         assert_eq!(bitv.to_string(), str);
     }
 
     #[test]
     fn test_to_bytes() {
-        let mut bv = Bitv::with_capacity(3, true);
+        let mut bv = Bitv::from_elem(3, true);
         bv.set(1, false);
         assert_eq!(bv.to_bytes(), vec!(0b10100000));
 
-        let mut bv = Bitv::with_capacity(9, false);
+        let mut bv = Bitv::from_elem(9, false);
         bv.set(2, true);
         bv.set(8, true);
         assert_eq!(bv.to_bytes(), vec!(0b00100000, 0b10000000));
@@ -2052,20 +2146,9 @@ mod tests {
     }
 
     #[test]
-    fn test_bitv_set_from_bools() {
-        let bools = vec![true, false, true, true];
-        let a: BitvSet = bools.iter().map(|n| *n).collect();
-        let mut b = BitvSet::new();
-        b.insert(0);
-        b.insert(2);
-        b.insert(3);
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn test_to_bools() {
         let bools = vec!(false, false, true, false, false, true, true, false);
-        assert_eq!(from_bytes(&[0b00100110]).iter().collect::<Vec<bool>>(), bools);
+        assert_eq!(Bitv::from_bytes(&[0b00100110]).iter().collect::<Vec<bool>>(), bools);
     }
 
     #[test]
@@ -2078,6 +2161,356 @@ mod tests {
         let long = Vec::from_fn(10000, |i| i % 2 == 0);
         let bitv: Bitv = long.iter().map(|n| *n).collect();
         assert_eq!(bitv.iter().collect::<Vec<bool>>(), long)
+    }
+
+    #[test]
+    fn test_small_difference() {
+        let mut b1 = Bitv::from_elem(3, false);
+        let mut b2 = Bitv::from_elem(3, false);
+        b1.set(0, true);
+        b1.set(1, true);
+        b2.set(1, true);
+        b2.set(2, true);
+        assert!(b1.difference(&b2));
+        assert!(b1.get(0));
+        assert!(!b1.get(1));
+        assert!(!b1.get(2));
+    }
+
+    #[test]
+    fn test_big_difference() {
+        let mut b1 = Bitv::from_elem(100, false);
+        let mut b2 = Bitv::from_elem(100, false);
+        b1.set(0, true);
+        b1.set(40, true);
+        b2.set(40, true);
+        b2.set(80, true);
+        assert!(b1.difference(&b2));
+        assert!(b1.get(0));
+        assert!(!b1.get(40));
+        assert!(!b1.get(80));
+    }
+
+    #[test]
+    fn test_small_clear() {
+        let mut b = Bitv::from_elem(14, true);
+        b.clear();
+        assert!(b.none());
+    }
+
+    #[test]
+    fn test_big_clear() {
+        let mut b = Bitv::from_elem(140, true);
+        b.clear();
+        assert!(b.none());
+    }
+
+    #[test]
+    fn test_bitv_lt() {
+        let mut a = Bitv::from_elem(5u, false);
+        let mut b = Bitv::from_elem(5u, false);
+
+        assert!(!(a < b) && !(b < a));
+        b.set(2, true);
+        assert!(a < b);
+        a.set(3, true);
+        assert!(a < b);
+        a.set(2, true);
+        assert!(!(a < b) && b < a);
+        b.set(0, true);
+        assert!(a < b);
+    }
+
+    #[test]
+    fn test_ord() {
+        let mut a = Bitv::from_elem(5u, false);
+        let mut b = Bitv::from_elem(5u, false);
+
+        assert!(a <= b && a >= b);
+        a.set(1, true);
+        assert!(a > b && a >= b);
+        assert!(b < a && b <= a);
+        b.set(1, true);
+        b.set(2, true);
+        assert!(b > a && b >= a);
+        assert!(a < b && a <= b);
+    }
+
+
+    #[test]
+    fn test_small_bitv_tests() {
+        let v = Bitv::from_bytes(&[0]);
+        assert!(!v.all());
+        assert!(!v.any());
+        assert!(v.none());
+
+        let v = Bitv::from_bytes(&[0b00010100]);
+        assert!(!v.all());
+        assert!(v.any());
+        assert!(!v.none());
+
+        let v = Bitv::from_bytes(&[0xFF]);
+        assert!(v.all());
+        assert!(v.any());
+        assert!(!v.none());
+    }
+
+    #[test]
+    fn test_big_bitv_tests() {
+        let v = Bitv::from_bytes(&[ // 88 bits
+            0, 0, 0, 0,
+            0, 0, 0, 0,
+            0, 0, 0]);
+        assert!(!v.all());
+        assert!(!v.any());
+        assert!(v.none());
+
+        let v = Bitv::from_bytes(&[ // 88 bits
+            0, 0, 0b00010100, 0,
+            0, 0, 0, 0b00110100,
+            0, 0, 0]);
+        assert!(!v.all());
+        assert!(v.any());
+        assert!(!v.none());
+
+        let v = Bitv::from_bytes(&[ // 88 bits
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF]);
+        assert!(v.all());
+        assert!(v.any());
+        assert!(!v.none());
+    }
+
+    #[test]
+    fn test_bitv_push_pop() {
+        let mut s = Bitv::from_elem(5 * u32::BITS - 2, false);
+        assert_eq!(s.len(), 5 * u32::BITS - 2);
+        assert_eq!(s.get(5 * u32::BITS - 3), false);
+        s.push(true);
+        s.push(true);
+        assert_eq!(s.get(5 * u32::BITS - 2), true);
+        assert_eq!(s.get(5 * u32::BITS - 1), true);
+        // Here the internal vector will need to be extended
+        s.push(false);
+        assert_eq!(s.get(5 * u32::BITS), false);
+        s.push(false);
+        assert_eq!(s.get(5 * u32::BITS + 1), false);
+        assert_eq!(s.len(), 5 * u32::BITS + 2);
+        // Pop it all off
+        assert_eq!(s.pop(), Some(false));
+        assert_eq!(s.pop(), Some(false));
+        assert_eq!(s.pop(), Some(true));
+        assert_eq!(s.pop(), Some(true));
+        assert_eq!(s.len(), 5 * u32::BITS - 2);
+    }
+
+    #[test]
+    fn test_bitv_truncate() {
+        let mut s = Bitv::from_elem(5 * u32::BITS, true);
+
+        assert_eq!(s, Bitv::from_elem(5 * u32::BITS, true));
+        assert_eq!(s.len(), 5 * u32::BITS);
+        s.truncate(4 * u32::BITS);
+        assert_eq!(s, Bitv::from_elem(4 * u32::BITS, true));
+        assert_eq!(s.len(), 4 * u32::BITS);
+        // Truncating to a size > s.len() should be a noop
+        s.truncate(5 * u32::BITS);
+        assert_eq!(s, Bitv::from_elem(4 * u32::BITS, true));
+        assert_eq!(s.len(), 4 * u32::BITS);
+        s.truncate(3 * u32::BITS - 10);
+        assert_eq!(s, Bitv::from_elem(3 * u32::BITS - 10, true));
+        assert_eq!(s.len(), 3 * u32::BITS - 10);
+        s.truncate(0);
+        assert_eq!(s, Bitv::from_elem(0, true));
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn test_bitv_reserve() {
+        let mut s = Bitv::from_elem(5 * u32::BITS, true);
+        // Check capacity
+        assert!(s.capacity() >= 5 * u32::BITS);
+        s.reserve(2 * u32::BITS);
+        assert!(s.capacity() >= 7 * u32::BITS);
+        s.reserve(7 * u32::BITS);
+        assert!(s.capacity() >= 12 * u32::BITS);
+        s.reserve_exact(7 * u32::BITS);
+        assert!(s.capacity() >= 12 * u32::BITS);
+        s.reserve(7 * u32::BITS + 1);
+        assert!(s.capacity() >= 12 * u32::BITS + 1);
+        // Check that length hasn't changed
+        assert_eq!(s.len(), 5 * u32::BITS);
+        s.push(true);
+        s.push(false);
+        s.push(true);
+        assert_eq!(s.get(5 * u32::BITS - 1), true);
+        assert_eq!(s.get(5 * u32::BITS - 0), true);
+        assert_eq!(s.get(5 * u32::BITS + 1), false);
+        assert_eq!(s.get(5 * u32::BITS + 2), true);
+    }
+
+    #[test]
+    fn test_bitv_grow() {
+        let mut bitv = Bitv::from_bytes(&[0b10110110, 0b00000000, 0b10101010]);
+        bitv.grow(32, true);
+        assert_eq!(bitv, Bitv::from_bytes(&[0b10110110, 0b00000000, 0b10101010,
+                                     0xFF, 0xFF, 0xFF, 0xFF]));
+        bitv.grow(64, false);
+        assert_eq!(bitv, Bitv::from_bytes(&[0b10110110, 0b00000000, 0b10101010,
+                                     0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]));
+        bitv.grow(16, true);
+        assert_eq!(bitv, Bitv::from_bytes(&[0b10110110, 0b00000000, 0b10101010,
+                                     0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF]));
+    }
+
+    #[test]
+    fn test_bitv_extend() {
+        let mut bitv = Bitv::from_bytes(&[0b10110110, 0b00000000, 0b11111111]);
+        let ext = Bitv::from_bytes(&[0b01001001, 0b10010010, 0b10111101]);
+        bitv.extend(ext.iter());
+        assert_eq!(bitv, Bitv::from_bytes(&[0b10110110, 0b00000000, 0b11111111,
+                                     0b01001001, 0b10010010, 0b10111101]));
+    }
+}
+
+
+
+
+#[cfg(test)]
+mod bitv_bench {
+    use std::prelude::*;
+    use std::rand;
+    use std::rand::Rng;
+    use std::u32;
+    use test::{Bencher, black_box};
+
+    use super::Bitv;
+
+    static BENCH_BITS : uint = 1 << 14;
+
+    fn rng() -> rand::IsaacRng {
+        let seed: &[_] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
+        rand::SeedableRng::from_seed(seed)
+    }
+
+    #[bench]
+    fn bench_uint_small(b: &mut Bencher) {
+        let mut r = rng();
+        let mut bitv = 0 as uint;
+        b.iter(|| {
+            for _ in range(0u, 100) {
+                bitv |= 1 << ((r.next_u32() as uint) % u32::BITS);
+            }
+            black_box(&bitv)
+        });
+    }
+
+    #[bench]
+    fn bench_bitv_set_big_fixed(b: &mut Bencher) {
+        let mut r = rng();
+        let mut bitv = Bitv::from_elem(BENCH_BITS, false);
+        b.iter(|| {
+            for _ in range(0u, 100) {
+                bitv.set((r.next_u32() as uint) % BENCH_BITS, true);
+            }
+            black_box(&bitv)
+        });
+    }
+
+    #[bench]
+    fn bench_bitv_set_big_variable(b: &mut Bencher) {
+        let mut r = rng();
+        let mut bitv = Bitv::from_elem(BENCH_BITS, false);
+        b.iter(|| {
+            for _ in range(0u, 100) {
+                bitv.set((r.next_u32() as uint) % BENCH_BITS, r.gen());
+            }
+            black_box(&bitv);
+        });
+    }
+
+    #[bench]
+    fn bench_bitv_set_small(b: &mut Bencher) {
+        let mut r = rng();
+        let mut bitv = Bitv::from_elem(u32::BITS, false);
+        b.iter(|| {
+            for _ in range(0u, 100) {
+                bitv.set((r.next_u32() as uint) % u32::BITS, true);
+            }
+            black_box(&bitv);
+        });
+    }
+
+    #[bench]
+    fn bench_bitv_big_union(b: &mut Bencher) {
+        let mut b1 = Bitv::from_elem(BENCH_BITS, false);
+        let b2 = Bitv::from_elem(BENCH_BITS, false);
+        b.iter(|| {
+            b1.union(&b2)
+        })
+    }
+
+    #[bench]
+    fn bench_bitv_small_iter(b: &mut Bencher) {
+        let bitv = Bitv::from_elem(u32::BITS, false);
+        b.iter(|| {
+            let mut sum = 0u;
+            for _ in range(0u, 10) {
+                for pres in bitv.iter() {
+                    sum += pres as uint;
+                }
+            }
+            sum
+        })
+    }
+
+    #[bench]
+    fn bench_bitv_big_iter(b: &mut Bencher) {
+        let bitv = Bitv::from_elem(BENCH_BITS, false);
+        b.iter(|| {
+            let mut sum = 0u;
+            for pres in bitv.iter() {
+                sum += pres as uint;
+            }
+            sum
+        })
+    }
+}
+
+
+
+
+
+
+
+#[cfg(test)]
+mod bitv_set_test {
+    use std::prelude::*;
+    use std::iter::range_step;
+
+    use super::{Bitv, BitvSet};
+    use vec::Vec;
+
+    #[test]
+    fn test_bitv_set_show() {
+        let mut s = BitvSet::new();
+        s.insert(1);
+        s.insert(10);
+        s.insert(50);
+        s.insert(2);
+        assert_eq!("{1, 2, 10, 50}", s.to_string());
+    }
+
+    #[test]
+    fn test_bitv_set_from_bools() {
+        let bools = vec![true, false, true, true];
+        let a: BitvSet = bools.iter().map(|n| *n).collect();
+        let mut b = BitvSet::new();
+        b.insert(0);
+        b.insert(2);
+        b.insert(3);
+        assert_eq!(a, b);
     }
 
     #[test]
@@ -2101,7 +2534,7 @@ mod tests {
         let lengths = [10, 64, 100];
         for &b in bools.iter() {
             for &l in lengths.iter() {
-                let bitset = BitvSet::from_bitv(Bitv::with_capacity(l, b));
+                let bitset = BitvSet::from_bitv(Bitv::from_elem(l, b));
                 assert_eq!(bitset.contains(&1u), b)
                 assert_eq!(bitset.contains(&(l-1u)), b)
                 assert!(!bitset.contains(&l))
@@ -2110,50 +2543,8 @@ mod tests {
     }
 
     #[test]
-    fn test_small_difference() {
-        let mut b1 = Bitv::with_capacity(3, false);
-        let mut b2 = Bitv::with_capacity(3, false);
-        b1.set(0, true);
-        b1.set(1, true);
-        b2.set(1, true);
-        b2.set(2, true);
-        assert!(b1.difference(&b2));
-        assert!(b1.get(0));
-        assert!(!b1.get(1));
-        assert!(!b1.get(2));
-    }
-
-    #[test]
-    fn test_big_difference() {
-        let mut b1 = Bitv::with_capacity(100, false);
-        let mut b2 = Bitv::with_capacity(100, false);
-        b1.set(0, true);
-        b1.set(40, true);
-        b2.set(40, true);
-        b2.set(80, true);
-        assert!(b1.difference(&b2));
-        assert!(b1.get(0));
-        assert!(!b1.get(40));
-        assert!(!b1.get(80));
-    }
-
-    #[test]
-    fn test_small_clear() {
-        let mut b = Bitv::with_capacity(14, true);
-        b.clear();
-        assert!(b.none());
-    }
-
-    #[test]
-    fn test_big_clear() {
-        let mut b = Bitv::with_capacity(140, true);
-        b.clear();
-        assert!(b.none());
-    }
-
-    #[test]
     fn test_bitv_masking() {
-        let b = Bitv::with_capacity(140, true);
+        let b = Bitv::from_elem(140, true);
         let mut bs = BitvSet::from_bitv(b);
         assert!(bs.contains(&139));
         assert!(!bs.contains(&140));
@@ -2166,22 +2557,14 @@ mod tests {
 
     #[test]
     fn test_bitv_set_basic() {
-        // calculate nbits with u32::BITS granularity
-        fn calc_nbits(bits: uint) -> uint {
-            u32::BITS * ((bits + u32::BITS - 1) / u32::BITS)
-        }
-
         let mut b = BitvSet::new();
-        assert_eq!(b.capacity(), calc_nbits(0));
         assert!(b.insert(3));
-        assert_eq!(b.capacity(), calc_nbits(3));
         assert!(!b.insert(3));
         assert!(b.contains(&3));
         assert!(b.insert(4));
         assert!(!b.insert(4));
         assert!(b.contains(&3));
         assert!(b.insert(400));
-        assert_eq!(b.capacity(), calc_nbits(400));
         assert!(!b.insert(400));
         assert!(b.contains(&400));
         assert_eq!(b.len(), 3);
@@ -2303,10 +2686,10 @@ mod tests {
 
     #[test]
     fn test_bitv_set_is_disjoint() {
-        let a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
-        let b = BitvSet::from_bitv(from_bytes(&[0b01000000]));
+        let a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
+        let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b01000000]));
         let c = BitvSet::new();
-        let d = BitvSet::from_bitv(from_bytes(&[0b00110000]));
+        let d = BitvSet::from_bitv(Bitv::from_bytes(&[0b00110000]));
 
         assert!(!a.is_disjoint(&d));
         assert!(!d.is_disjoint(&a));
@@ -2326,13 +2709,13 @@ mod tests {
         a.insert(0);
         let mut b = BitvSet::new();
         b.insert(5);
-        let expected = BitvSet::from_bitv(from_bytes(&[0b10000100]));
+        let expected = BitvSet::from_bitv(Bitv::from_bytes(&[0b10000100]));
         a.union_with(&b);
         assert_eq!(a, expected);
 
         // Standard
-        let mut a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
-        let mut b = BitvSet::from_bitv(from_bytes(&[0b01100010]));
+        let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
+        let mut b = BitvSet::from_bitv(Bitv::from_bytes(&[0b01100010]));
         let c = a.clone();
         a.union_with(&b);
         b.union_with(&c);
@@ -2343,8 +2726,8 @@ mod tests {
     #[test]
     fn test_bitv_set_intersect_with() {
         // Explicitly 0'ed bits
-        let mut a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
-        let mut b = BitvSet::from_bitv(from_bytes(&[0b00000000]));
+        let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
+        let mut b = BitvSet::from_bitv(Bitv::from_bytes(&[0b00000000]));
         let c = a.clone();
         a.intersect_with(&b);
         b.intersect_with(&c);
@@ -2352,7 +2735,7 @@ mod tests {
         assert!(b.is_empty());
 
         // Uninitialized bits should behave like 0's
-        let mut a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
+        let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
         let mut b = BitvSet::new();
         let c = a.clone();
         a.intersect_with(&b);
@@ -2361,8 +2744,8 @@ mod tests {
         assert!(b.is_empty());
 
         // Standard
-        let mut a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
-        let mut b = BitvSet::from_bitv(from_bytes(&[0b01100010]));
+        let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
+        let mut b = BitvSet::from_bitv(Bitv::from_bytes(&[0b01100010]));
         let c = a.clone();
         a.intersect_with(&b);
         b.intersect_with(&c);
@@ -2373,20 +2756,20 @@ mod tests {
     #[test]
     fn test_bitv_set_difference_with() {
         // Explicitly 0'ed bits
-        let mut a = BitvSet::from_bitv(from_bytes(&[0b00000000]));
-        let b = BitvSet::from_bitv(from_bytes(&[0b10100010]));
+        let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[0b00000000]));
+        let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
         a.difference_with(&b);
         assert!(a.is_empty());
 
         // Uninitialized bits should behave like 0's
         let mut a = BitvSet::new();
-        let b = BitvSet::from_bitv(from_bytes(&[0b11111111]));
+        let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b11111111]));
         a.difference_with(&b);
         assert!(a.is_empty());
 
         // Standard
-        let mut a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
-        let mut b = BitvSet::from_bitv(from_bytes(&[0b01100010]));
+        let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
+        let mut b = BitvSet::from_bitv(Bitv::from_bytes(&[0b01100010]));
         let c = a.clone();
         a.difference_with(&b);
         b.difference_with(&c);
@@ -2403,19 +2786,19 @@ mod tests {
         let mut b = BitvSet::new();
         b.insert(1);
         b.insert(5);
-        let expected = BitvSet::from_bitv(from_bytes(&[0b10000100]));
+        let expected = BitvSet::from_bitv(Bitv::from_bytes(&[0b10000100]));
         a.symmetric_difference_with(&b);
         assert_eq!(a, expected);
 
-        let mut a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
+        let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
         let b = BitvSet::new();
         let c = a.clone();
         a.symmetric_difference_with(&b);
         assert_eq!(a, c);
 
         // Standard
-        let mut a = BitvSet::from_bitv(from_bytes(&[0b11100010]));
-        let mut b = BitvSet::from_bitv(from_bytes(&[0b01101010]));
+        let mut a = BitvSet::from_bitv(Bitv::from_bytes(&[0b11100010]));
+        let mut b = BitvSet::from_bitv(Bitv::from_bytes(&[0b01101010]));
         let c = a.clone();
         a.symmetric_difference_with(&b);
         b.symmetric_difference_with(&c);
@@ -2425,8 +2808,8 @@ mod tests {
 
     #[test]
     fn test_bitv_set_eq() {
-        let a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
-        let b = BitvSet::from_bitv(from_bytes(&[0b00000000]));
+        let a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
+        let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b00000000]));
         let c = BitvSet::new();
 
         assert!(a == a);
@@ -2439,8 +2822,8 @@ mod tests {
 
     #[test]
     fn test_bitv_set_cmp() {
-        let a = BitvSet::from_bitv(from_bytes(&[0b10100010]));
-        let b = BitvSet::from_bitv(from_bytes(&[0b00000000]));
+        let a = BitvSet::from_bitv(Bitv::from_bytes(&[0b10100010]));
+        let b = BitvSet::from_bitv(Bitv::from_bytes(&[0b00000000]));
         let c = BitvSet::new();
 
         assert_eq!(a.cmp(&b), Greater);
@@ -2464,38 +2847,6 @@ mod tests {
         assert!(a.insert(1000));
         assert!(a.remove(&1000));
         a.shrink_to_fit();
-        assert_eq!(a.capacity(), u32::BITS);
-    }
-
-    #[test]
-    fn test_bitv_lt() {
-        let mut a = Bitv::with_capacity(5u, false);
-        let mut b = Bitv::with_capacity(5u, false);
-
-        assert!(!(a < b) && !(b < a));
-        b.set(2, true);
-        assert!(a < b);
-        a.set(3, true);
-        assert!(a < b);
-        a.set(2, true);
-        assert!(!(a < b) && b < a);
-        b.set(0, true);
-        assert!(a < b);
-    }
-
-    #[test]
-    fn test_ord() {
-        let mut a = Bitv::with_capacity(5u, false);
-        let mut b = Bitv::with_capacity(5u, false);
-
-        assert!(a <= b && a >= b);
-        a.set(1, true);
-        assert!(a > b && a >= b);
-        assert!(b < a && b <= a);
-        b.set(1, true);
-        b.set(2, true);
-        assert!(b > a && b >= a);
-        assert!(a < b && a <= b);
     }
 
     #[test]
@@ -2516,204 +2867,27 @@ mod tests {
         assert!(a.remove(&1000));
         assert!(b.contains(&1000));
     }
+}
 
-    #[test]
-    fn test_small_bitv_tests() {
-        let v = from_bytes(&[0]);
-        assert!(!v.all());
-        assert!(!v.any());
-        assert!(v.none());
 
-        let v = from_bytes(&[0b00010100]);
-        assert!(!v.all());
-        assert!(v.any());
-        assert!(!v.none());
 
-        let v = from_bytes(&[0xFF]);
-        assert!(v.all());
-        assert!(v.any());
-        assert!(!v.none());
-    }
 
-    #[test]
-    fn test_big_bitv_tests() {
-        let v = from_bytes(&[ // 88 bits
-            0, 0, 0, 0,
-            0, 0, 0, 0,
-            0, 0, 0]);
-        assert!(!v.all());
-        assert!(!v.any());
-        assert!(v.none());
 
-        let v = from_bytes(&[ // 88 bits
-            0, 0, 0b00010100, 0,
-            0, 0, 0, 0b00110100,
-            0, 0, 0]);
-        assert!(!v.all());
-        assert!(v.any());
-        assert!(!v.none());
+#[cfg(test)]
+mod bitv_set_bench {
+    use std::prelude::*;
+    use std::rand;
+    use std::rand::Rng;
+    use std::u32;
+    use test::{Bencher, black_box};
 
-        let v = from_bytes(&[ // 88 bits
-            0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF, 0xFF,
-            0xFF, 0xFF, 0xFF]);
-        assert!(v.all());
-        assert!(v.any());
-        assert!(!v.none());
-    }
+    use super::{Bitv, BitvSet};
 
-    #[test]
-    fn test_bitv_push_pop() {
-        let mut s = Bitv::with_capacity(5 * u32::BITS - 2, false);
-        assert_eq!(s.len(), 5 * u32::BITS - 2);
-        assert_eq!(s.get(5 * u32::BITS - 3), false);
-        s.push(true);
-        s.push(true);
-        assert_eq!(s.get(5 * u32::BITS - 2), true);
-        assert_eq!(s.get(5 * u32::BITS - 1), true);
-        // Here the internal vector will need to be extended
-        s.push(false);
-        assert_eq!(s.get(5 * u32::BITS), false);
-        s.push(false);
-        assert_eq!(s.get(5 * u32::BITS + 1), false);
-        assert_eq!(s.len(), 5 * u32::BITS + 2);
-        // Pop it all off
-        assert_eq!(s.pop(), false);
-        assert_eq!(s.pop(), false);
-        assert_eq!(s.pop(), true);
-        assert_eq!(s.pop(), true);
-        assert_eq!(s.len(), 5 * u32::BITS - 2);
-    }
-
-    #[test]
-    fn test_bitv_truncate() {
-        let mut s = Bitv::with_capacity(5 * u32::BITS, true);
-
-        assert_eq!(s, Bitv::with_capacity(5 * u32::BITS, true));
-        assert_eq!(s.len(), 5 * u32::BITS);
-        s.truncate(4 * u32::BITS);
-        assert_eq!(s, Bitv::with_capacity(4 * u32::BITS, true));
-        assert_eq!(s.len(), 4 * u32::BITS);
-        // Truncating to a size > s.len() should be a noop
-        s.truncate(5 * u32::BITS);
-        assert_eq!(s, Bitv::with_capacity(4 * u32::BITS, true));
-        assert_eq!(s.len(), 4 * u32::BITS);
-        s.truncate(3 * u32::BITS - 10);
-        assert_eq!(s, Bitv::with_capacity(3 * u32::BITS - 10, true));
-        assert_eq!(s.len(), 3 * u32::BITS - 10);
-        s.truncate(0);
-        assert_eq!(s, Bitv::with_capacity(0, true));
-        assert_eq!(s.len(), 0);
-    }
-
-    #[test]
-    fn test_bitv_reserve() {
-        let mut s = Bitv::with_capacity(5 * u32::BITS, true);
-        // Check capacity
-        assert_eq!(s.capacity(), 5 * u32::BITS);
-        s.reserve(2 * u32::BITS);
-        assert_eq!(s.capacity(), 5 * u32::BITS);
-        s.reserve(7 * u32::BITS);
-        assert_eq!(s.capacity(), 7 * u32::BITS);
-        s.reserve(7 * u32::BITS);
-        assert_eq!(s.capacity(), 7 * u32::BITS);
-        s.reserve(7 * u32::BITS + 1);
-        assert_eq!(s.capacity(), 8 * u32::BITS);
-        // Check that length hasn't changed
-        assert_eq!(s.len(), 5 * u32::BITS);
-        s.push(true);
-        s.push(false);
-        s.push(true);
-        assert_eq!(s.get(5 * u32::BITS - 1), true);
-        assert_eq!(s.get(5 * u32::BITS - 0), true);
-        assert_eq!(s.get(5 * u32::BITS + 1), false);
-        assert_eq!(s.get(5 * u32::BITS + 2), true);
-    }
-
-    #[test]
-    fn test_bitv_grow() {
-        let mut bitv = from_bytes(&[0b10110110, 0b00000000, 0b10101010]);
-        bitv.grow(32, true);
-        assert_eq!(bitv, from_bytes(&[0b10110110, 0b00000000, 0b10101010,
-                                     0xFF, 0xFF, 0xFF, 0xFF]));
-        bitv.grow(64, false);
-        assert_eq!(bitv, from_bytes(&[0b10110110, 0b00000000, 0b10101010,
-                                     0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0]));
-        bitv.grow(16, true);
-        assert_eq!(bitv, from_bytes(&[0b10110110, 0b00000000, 0b10101010,
-                                     0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF]));
-    }
-
-    #[test]
-    fn test_bitv_extend() {
-        let mut bitv = from_bytes(&[0b10110110, 0b00000000, 0b11111111]);
-        let ext = from_bytes(&[0b01001001, 0b10010010, 0b10111101]);
-        bitv.extend(ext.iter());
-        assert_eq!(bitv, from_bytes(&[0b10110110, 0b00000000, 0b11111111,
-                                     0b01001001, 0b10010010, 0b10111101]));
-    }
-
-    #[test]
-    fn test_bitv_set_show() {
-        let mut s = BitvSet::new();
-        s.insert(1);
-        s.insert(10);
-        s.insert(50);
-        s.insert(2);
-        assert_eq!("{1, 2, 10, 50}", s.to_string());
-    }
+    static BENCH_BITS : uint = 1 << 14;
 
     fn rng() -> rand::IsaacRng {
         let seed: &[_] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 0];
         rand::SeedableRng::from_seed(seed)
-    }
-
-    #[bench]
-    fn bench_uint_small(b: &mut Bencher) {
-        let mut r = rng();
-        let mut bitv = 0 as uint;
-        b.iter(|| {
-            for _ in range(0u, 100) {
-                bitv |= 1 << ((r.next_u32() as uint) % u32::BITS);
-            }
-            black_box(&bitv)
-        });
-    }
-
-    #[bench]
-    fn bench_bitv_set_big_fixed(b: &mut Bencher) {
-        let mut r = rng();
-        let mut bitv = Bitv::with_capacity(BENCH_BITS, false);
-        b.iter(|| {
-            for _ in range(0u, 100) {
-                bitv.set((r.next_u32() as uint) % BENCH_BITS, true);
-            }
-            black_box(&bitv)
-        });
-    }
-
-    #[bench]
-    fn bench_bitv_set_big_variable(b: &mut Bencher) {
-        let mut r = rng();
-        let mut bitv = Bitv::with_capacity(BENCH_BITS, false);
-        b.iter(|| {
-            for _ in range(0u, 100) {
-                bitv.set((r.next_u32() as uint) % BENCH_BITS, r.gen());
-            }
-            black_box(&bitv);
-        });
-    }
-
-    #[bench]
-    fn bench_bitv_set_small(b: &mut Bencher) {
-        let mut r = rng();
-        let mut bitv = Bitv::with_capacity(u32::BITS, false);
-        b.iter(|| {
-            for _ in range(0u, 100) {
-                bitv.set((r.next_u32() as uint) % u32::BITS, true);
-            }
-            black_box(&bitv);
-        });
     }
 
     #[bench]
@@ -2741,43 +2915,8 @@ mod tests {
     }
 
     #[bench]
-    fn bench_bitv_big_union(b: &mut Bencher) {
-        let mut b1 = Bitv::with_capacity(BENCH_BITS, false);
-        let b2 = Bitv::with_capacity(BENCH_BITS, false);
-        b.iter(|| {
-            b1.union(&b2)
-        })
-    }
-
-    #[bench]
-    fn bench_bitv_small_iter(b: &mut Bencher) {
-        let bitv = Bitv::with_capacity(u32::BITS, false);
-        b.iter(|| {
-            let mut sum = 0u;
-            for _ in range(0u, 10) {
-                for pres in bitv.iter() {
-                    sum += pres as uint;
-                }
-            }
-            sum
-        })
-    }
-
-    #[bench]
-    fn bench_bitv_big_iter(b: &mut Bencher) {
-        let bitv = Bitv::with_capacity(BENCH_BITS, false);
-        b.iter(|| {
-            let mut sum = 0u;
-            for pres in bitv.iter() {
-                sum += pres as uint;
-            }
-            sum
-        })
-    }
-
-    #[bench]
     fn bench_bitvset_iter(b: &mut Bencher) {
-        let bitv = BitvSet::from_bitv(from_fn(BENCH_BITS,
+        let bitv = BitvSet::from_bitv(Bitv::from_fn(BENCH_BITS,
                                               |idx| {idx % 3 == 0}));
         b.iter(|| {
             let mut sum = 0u;
