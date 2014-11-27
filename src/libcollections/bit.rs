@@ -87,7 +87,8 @@ use std::hash;
 
 use vec::Vec;
 
-type Blocks<'a> = Take<Cloned<Items<'a, u32>>>;
+type Blocks<'a> = Cloned<Items<'a, u32>>
+type MutBlocks<'a> MutItems<'a, u32>;
 type MatchWords<'a> = Chain<Enumerate<Blocks<'a>>, Skip<Take<Enumerate<Repeat<u32>>>>>;
 
 // Take two BitV's, and return iterators of their words, where the shorter one
@@ -196,15 +197,15 @@ impl Bitv {
     }
 
     /// Iterator over mutable refs to  the underlying blocks of data.
-    fn blocks_mut(&mut self) -> Take<MutItems<u32>> {
+    fn blocks_mut(&mut self) -> MutBlocks {
         let blocks = blocks_for_bits(self.len());
-        self.storage.iter_mut().take(blocks)
+        self.storage[..blocks].iter_mut()
     }
 
     /// Iterator over the underlying blocks of data
-    fn blocks(&self) -> Take<Cloned<Items<u32>>> {
+    fn blocks(&self) -> Blocks {
         let blocks = blocks_for_bits(self.len());
-        self.storage.iter().cloned().take(blocks)
+        self.storage[..blocks].iter().cloned()
     }
 
     /// An operation might screw up the unused bits in the last block of the Bitv.
@@ -259,7 +260,7 @@ impl Bitv {
 
     /// Constructs a new, empty `Bitv` with the specified capacity.
     ///
-    /// The bitvector will be able to hold exactly `capacity` bits without
+    /// The bitvector will be able to hold at least `capacity` bits without
     /// reallocating. If `capacity` is 0, it will not allocate.
     ///
     /// It is important to note that this function does not specify the
