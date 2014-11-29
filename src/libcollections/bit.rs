@@ -836,11 +836,9 @@ impl Bitv {
             None
         } else {
             let ret = self[self.nbits - 1];
-            // If we are unusing a whole word, make sure it is zeroed out
+            // Second rule of Bitv Club
+            self.set(self.nbits - 1, false);
             self.nbits -= 1;
-            if self.nbits % u32::BITS == 0 {
-                self.storage[self.nbits / u32::BITS] = 0;
-            }
             Some(ret)
         }
     }
