@@ -148,7 +148,7 @@ pub struct Bitv {
 impl Index<uint,bool> for Bitv {
     #[inline]
     fn index<'a>(&'a self, i: &uint) -> &'a bool {
-        if self.get(*i) {
+        if self.get(*i).expect("index out of bounds") {
             &TRUE
         } else {
             &FALSE
@@ -315,11 +315,7 @@ impl Bitv {
         bitv
     }
 
-    /// Retrieves the value at index `i`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `i` is out of bounds.
+    /// Retrieves the value at index `i`, or `None` if the index is out of bounds.
     ///
     /// # Examples
     ///
@@ -327,20 +323,22 @@ impl Bitv {
     /// use std::collections::Bitv;
     ///
     /// let bv = Bitv::from_bytes(&[0b01100000]);
-    /// assert_eq!(bv.get(0), false);
-    /// assert_eq!(bv.get(1), true);
+    /// assert_eq!(bv.get(0), Some(false));
+    /// assert_eq!(bv.get(1), Some(true));
+    /// assert_eq!(bv.get(100), None);
     ///
     /// // Can also use array indexing
     /// assert_eq!(bv[1], true);
     /// ```
     #[inline]
     #[unstable = "panic semantics are likely to change in the future"]
-    pub fn get(&self, i: uint) -> bool {
+    pub fn get(&self, i: uint) -> Option<bool> {
         assert!(i < self.nbits);
         let w = i / u32::BITS;
         let b = i % u32::BITS;
-        let x = self.storage[w] & (1 << b);
-        x != 0
+        self.storage.get(w).map(|block|
+            (block & (1 << b)) != 0
+        )
     }
 
     /// Sets the value of a bit at an index `i`.
@@ -609,7 +607,7 @@ impl Bitv {
             if offset >= bitv.nbits {
                 0
             } else {
-                bitv.get(offset) as u8 << (7 - bit)
+                bitv[offset] as u8 << (7 - bit)
             }
         }
 
@@ -630,7 +628,7 @@ impl Bitv {
     /// Deprecated: Use `iter().collect()`.
     #[deprecated = "Use `iter().collect()`"]
     pub fn to_bools(&self) -> Vec<bool> {
-        Vec::from_fn(self.nbits, |i| self.get(i))
+        Vec::from_fn(self.nbits, |i| self[i])
     }
 
     /// Compares a `Bitv` to a slice of `bool`s.
@@ -654,7 +652,7 @@ impl Bitv {
         assert_eq!(self.nbits, v.len());
         let mut i = 0;
         while i < self.nbits {
-            if self.get(i) != v[i] { return false; }
+            if self[i] != v[i] { return false; }
             i = i + 1;
         }
         true
@@ -837,7 +835,7 @@ impl Bitv {
         if self.is_empty() {
             None
         } else {
-            let ret = self.get(self.nbits - 1);
+            let ret = self[self.nbits - 1];
             // If we are unusing a whole word, make sure it is zeroed out
             self.nbits -= 1;
             if self.nbits % u32::BITS == 0 {
@@ -993,7 +991,7 @@ impl<'a> Iterator<bool> for Bits<'a> {
         if self.next_idx != self.end_idx {
             let idx = self.next_idx;
             self.next_idx += 1;
-            Some(self.bitv.get(idx))
+            Some(self.bitv[idx])
         } else {
             None
         }
@@ -1010,7 +1008,7 @@ impl<'a> DoubleEndedIterator<bool> for Bits<'a> {
     fn next_back(&mut self) -> Option<bool> {
         if self.next_idx != self.end_idx {
             self.end_idx -= 1;
-            Some(self.bitv.get(self.end_idx))
+            Some(self.bitv[self.end_idx])
         } else {
             None
         }
@@ -1030,7 +1028,7 @@ impl<'a> RandomAccessIterator<bool> for Bits<'a> {
         if index >= self.indexable() {
             None
         } else {
-            Some(self.bitv.get(index))
+            Some(self.bitv[index])
         }
     }
 }
@@ -1071,7 +1069,7 @@ impl<'a> RandomAccessIterator<bool> for Bits<'a> {
 ///
 /// // Can convert back to a `Bitv`
 /// let bv: Bitv = s.into_bitv();
-/// assert!(bv.get(3));
+/// assert!(bv[3]);
 /// ```
 #[deriving(Clone)]
 pub struct BitvSet {
@@ -1260,8 +1258,8 @@ impl BitvSet {
     /// s.insert(3);
     ///
     /// let bv = s.into_bitv();
-    /// assert!(bv.get(0));
-    /// assert!(bv.get(3));
+    /// assert!(bv[0]);
+    /// assert!(bv[3]);
     /// ```
     #[inline]
     pub fn into_bitv(self) -> Bitv {
@@ -1615,7 +1613,7 @@ impl BitvSet {
     #[unstable = "matches collection reform specification, waiting for dust to settle"]
     pub fn contains(&self, value: &uint) -> bool {
         let bitv = &self.bitv;
-        *value < bitv.nbits && bitv.get(*value)
+        *value < bitv.nbits && bitv[*value]
     }
 
     /// Returns `true` if the set has no elements in common with `other`.
@@ -2173,9 +2171,9 @@ mod bitv_test {
         b2.set(1, true);
         b2.set(2, true);
         assert!(b1.difference(&b2));
-        assert!(b1.get(0));
-        assert!(!b1.get(1));
-        assert!(!b1.get(2));
+        assert!(b1[0]);
+        assert!(!b1[1]);
+        assert!(!b1[2]);
     }
 
     #[test]
@@ -2187,9 +2185,9 @@ mod bitv_test {
         b2.set(40, true);
         b2.set(80, true);
         assert!(b1.difference(&b2));
-        assert!(b1.get(0));
-        assert!(!b1.get(40));
-        assert!(!b1.get(80));
+        assert!(b1[0]);
+        assert!(!b1[40]);
+        assert!(!b1[80]);
     }
 
     #[test]
@@ -2287,16 +2285,16 @@ mod bitv_test {
     fn test_bitv_push_pop() {
         let mut s = Bitv::from_elem(5 * u32::BITS - 2, false);
         assert_eq!(s.len(), 5 * u32::BITS - 2);
-        assert_eq!(s.get(5 * u32::BITS - 3), false);
+        assert_eq!(s[5 * u32::BITS - 3], false);
         s.push(true);
         s.push(true);
-        assert_eq!(s.get(5 * u32::BITS - 2), true);
-        assert_eq!(s.get(5 * u32::BITS - 1), true);
+        assert_eq!(s[5 * u32::BITS - 2], true);
+        assert_eq!(s[5 * u32::BITS - 1], true);
         // Here the internal vector will need to be extended
         s.push(false);
-        assert_eq!(s.get(5 * u32::BITS), false);
+        assert_eq!(s[5 * u32::BITS], false);
         s.push(false);
-        assert_eq!(s.get(5 * u32::BITS + 1), false);
+        assert_eq!(s[5 * u32::BITS + 1], false);
         assert_eq!(s.len(), 5 * u32::BITS + 2);
         // Pop it all off
         assert_eq!(s.pop(), Some(false));
@@ -2345,10 +2343,10 @@ mod bitv_test {
         s.push(true);
         s.push(false);
         s.push(true);
-        assert_eq!(s.get(5 * u32::BITS - 1), true);
-        assert_eq!(s.get(5 * u32::BITS - 0), true);
-        assert_eq!(s.get(5 * u32::BITS + 1), false);
-        assert_eq!(s.get(5 * u32::BITS + 2), true);
+        assert_eq!(s[5 * u32::BITS - 1], true);
+        assert_eq!(s[5 * u32::BITS - 0], true);
+        assert_eq!(s[5 * u32::BITS + 1], false);
+        assert_eq!(s[5 * u32::BITS + 2], true);
     }
 
     #[test]
