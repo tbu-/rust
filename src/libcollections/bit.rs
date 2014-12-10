@@ -794,15 +794,15 @@ impl Bitv {
         let new_nblocks = blocks_for_bits(new_nbits);
         let full_value = if value { !0 } else { 0 };
 
-        // Correct the old tail word
+        // Correct the old tail word, setting or clearing formerly unused bits
         let old_last_word = blocks_for_bits(self.nbits) - 1;
         if self.nbits % u32::BITS > 0 {
-            let overhang = self.nbits % u32::BITS; // # of already-used bits
-            let mask = !((1 << overhang) - 1);  // e.g. 5 unused bits => 111110..0
+            let mask = mask_for_bits(self.nbits);
             if value {
-                self.storage[old_last_word] |= mask;
+                self.storage[old_last_word] |= !mask;
             } else {
-                self.storage[old_last_word] &= !mask;
+                // Extra bits are already supposed to be zero by invariant, but play it safe...
+                self.storage[old_last_word] &= mask;
             }
         }
 
