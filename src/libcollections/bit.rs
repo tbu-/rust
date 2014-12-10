@@ -177,7 +177,7 @@ fn blocks_for_bits(bits: uint) -> uint {
 /// Computes the bitmask for the final word of the vector
 fn mask_for_bits(bits: uint) -> u32 {
     // Note especially that a perfect multiple of u32::BITS should mask all 1s.
-    !0u32 >> (u32::BITS - bits % u32::BITS)
+    !0u32 >> (u32::BITS - bits % u32::BITS) % u32::BITS
 }
 
 impl Bitv {
