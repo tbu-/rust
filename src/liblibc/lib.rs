@@ -3611,6 +3611,7 @@ pub mod consts {
         pub mod posix08 {
             use types::os::arch::c95::c_int;
             pub const O_CLOEXEC: c_int = 0x80000;
+            pub const F_DUPFD_CLOEXEC: c_int = 1030;
         }
         #[cfg(any(target_arch = "arm",
                   target_arch = "aarch64",
@@ -4274,11 +4275,13 @@ pub mod consts {
         pub mod posix08 {
             use types::os::arch::c95::c_int;
             pub const O_CLOEXEC: c_int = 0x100000;
+            pub const F_DUPFD_CLOEXEC: c_int = 17;
         }
         #[cfg(target_os = "dragonfly")]
         pub mod posix08 {
             use types::os::arch::c95::c_int;
             pub const O_CLOEXEC: c_int = 0x20000;
+            pub const F_DUPFD_CLOEXEC: c_int = 17;
         }
         pub mod bsd44 {
             use types::os::arch::c95::c_int;
@@ -4643,7 +4646,7 @@ pub mod consts {
             pub const F_GETLK : c_int = 7;
             pub const F_SETLK : c_int = 8;
             pub const F_SETLKW : c_int = 9;
-            pub const F_DUPFD_CLOEXEC : c_int = 10;
+            pub use consts::os::posix08::F_DUPFD_CLOEXEC;
 
             pub const SIGTRAP : c_int = 5;
             pub const SIG_IGN: size_t = 1;
@@ -4725,11 +4728,13 @@ pub mod consts {
         pub mod posix08 {
             use types::os::arch::c95::c_int;
             pub const O_CLOEXEC: c_int = 0x10000;
+            pub const F_DUPFD_CLOEXEC: c_int = 10;
         }
         #[cfg(target_os = "netbsd")]
         pub mod posix08 {
             use types::os::arch::c95::c_int;
             pub const O_CLOEXEC: c_int = 0x400000;
+            pub const F_DUPFD_CLOEXEC: c_int = 12;
         }
         pub mod bsd44 {
             use types::os::arch::c95::c_int;
@@ -5169,6 +5174,7 @@ pub mod consts {
         pub mod posix08 {
             use types::os::arch::c95::c_int;
             pub const O_CLOEXEC: c_int = 0x1000000;
+            pub const F_DUPFD_CLOEXEC: c_int = 67;
         }
         pub mod bsd44 {
             use types::os::arch::c95::c_int;

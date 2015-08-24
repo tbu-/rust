@@ -13,10 +13,12 @@ use prelude::v1::*;
 use ffi::CStr;
 use io;
 use libc::{self, c_int, size_t};
-use str;
-use sys::c;
 use net::SocketAddr;
+use str;
+use sync::Once;
+use sys::c;
 use sys::fd::FileDesc;
+use sys::os;
 use sys_common::{AsInner, FromInner, IntoInner};
 use sys_common::net::{getsockopt, setsockopt};
 use time::Duration;
@@ -66,9 +68,41 @@ impl Socket {
     }
 
     pub fn duplicate(&self) -> io::Result<Socket> {
-        let fd = try!(cvt(unsafe { libc::dup(self.0.raw()) }));
+        use libc::funcs::posix88::fcntl::fcntl;
+        const ZERO: c_int = 0;
+        #[cfg(target_os = "linux")]
+        fn fcntl_dupfd() -> c_int {
+            static START: Once = Once::new();
+            static mut FCNTL_DUPFD: c_int = 0xdead;
+            START.call_once(|| unsafe {
+                // Detect whether the kernel supports F_DUPFD_CLOEXEC. If it
+                // doesn't, it'll immediately return `EINVAL`. Otherwise, it'll
+                // return `EBADF` because we passed in a bad file descriptor.
+                //
+                // Store the result in a global variable so we only have to
+                // calculate it once.
+                let result = fcntl(-1, libc::F_DUPFD_CLOEXEC, ZERO);
+                let errno = os::errno();
+                assert!(result == -1 && (errno == libc::EBADF || errno == libc::EINVAL), "errno={}", errno);
+                if result == libc::EINVAL {
+                    FCNTL_DUPFD = libc::F_DUPFD_CLOEXEC;
+                } else {
+                    FCNTL_DUPFD = libc::F_DUPFD;
+                }
+            });
+            unsafe { FCNTL_DUPFD }
+        }
+        #[cfg(not(target_os = "linux"))]
+        fn fcntl_dupfd() -> c_int {
+            libc::F_DUPFD_CLOEXEC
+        }
+
+        let fcntl_dupfd = fcntl_dupfd();
+        let fd = try!(cvt(unsafe { fcntl(self.0.raw(), fcntl_dupfd, ZERO) }));
         let fd = FileDesc::new(fd);
-        fd.set_cloexec();
+        if fcntl_dupfd != libc::F_DUPFD_CLOEXEC {
+            fd.set_cloexec();
+        }
         Ok(Socket(fd))
     }
 
