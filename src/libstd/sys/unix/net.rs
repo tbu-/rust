@@ -70,40 +70,29 @@ impl Socket {
     pub fn duplicate(&self) -> io::Result<Socket> {
         use libc::funcs::posix88::fcntl::fcntl;
         const ZERO: c_int = 0;
-        #[cfg(target_os = "linux")]
-        fn fcntl_dupfd() -> c_int {
-            static START: Once = Once::new();
-            static mut FCNTL_DUPFD: c_int = 0xdead;
-            START.call_once(|| unsafe {
-                // Detect whether the kernel supports F_DUPFD_CLOEXEC. If it
-                // doesn't, it'll immediately return `EINVAL`. Otherwise, it'll
-                // return `EBADF` because we passed in a bad file descriptor.
+        static EMULATE_F_DUPFD_CLOEXEC: AtomicBool = AtomicBool::new(false);
+        if !EMULATE_F_DUPFD.load(atomic::Ordering::Relaxed) {
+            match cvt(unsafe { fcntl(self.raw().0, libc::F_DUPFD_CLOEXEC, ZERO) }) {
+                // `EINVAL` can only be returned on two occasions: Invalid
+                // command (second parameter) or invalid third parameter. 0 is
+                // always a valid third parameter, so it must be the second
+                // parameter.
                 //
-                // Store the result in a global variable so we only have to
-                // calculate it once.
-                let result = fcntl(-1, libc::F_DUPFD_CLOEXEC, ZERO);
-                let errno = os::errno();
-                assert!(result == -1 && (errno == libc::EBADF || errno == libc::EINVAL), "errno={}", errno);
-                if result == libc::EINVAL {
-                    FCNTL_DUPFD = libc::F_DUPFD_CLOEXEC;
-                } else {
-                    FCNTL_DUPFD = libc::F_DUPFD;
+                // Store the result in a global variable so we don't try each
+                // syscall twice.
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                    EMULATE_F_DUPFD_CLOEXEC.store(true, atomic::Ordering::Relaxed);
                 }
-            });
-            unsafe { FCNTL_DUPFD }
+                res => return res.map(|fd| Socket(FileDesc::new(fd))),
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        fn fcntl_dupfd() -> c_int {
-            libc::F_DUPFD_CLOEXEC
-        }
-
-        let fcntl_dupfd = fcntl_dupfd();
-        let fd = try!(cvt(unsafe { fcntl(self.0.raw(), fcntl_dupfd, ZERO) }));
-        let fd = FileDesc::new(fd);
-        if fcntl_dupfd != libc::F_DUPFD_CLOEXEC {
+        cvt(
+            unsafe { fcntl(self.raw().0, libc::F_DUPFD, ZERO) }
+        ).map(|fd| {
+            let fd = FileDesc::new(fd);
             fd.set_cloexec();
-        }
-        Ok(Socket(fd))
+            Socket(fd)
+        })
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
