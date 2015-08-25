@@ -15,10 +15,9 @@ use io;
 use libc::{self, c_int, size_t};
 use net::SocketAddr;
 use str;
-use sync::Once;
+use sync::atomic::{self, AtomicBool};
 use sys::c;
 use sys::fd::FileDesc;
-use sys::os;
 use sys_common::{AsInner, FromInner, IntoInner};
 use sys_common::net::{getsockopt, setsockopt};
 use time::Duration;
@@ -71,8 +70,8 @@ impl Socket {
         use libc::funcs::posix88::fcntl::fcntl;
         const ZERO: c_int = 0;
         static EMULATE_F_DUPFD_CLOEXEC: AtomicBool = AtomicBool::new(false);
-        if !EMULATE_F_DUPFD.load(atomic::Ordering::Relaxed) {
-            match cvt(unsafe { fcntl(self.raw().0, libc::F_DUPFD_CLOEXEC, ZERO) }) {
+        if !EMULATE_F_DUPFD_CLOEXEC.load(atomic::Ordering::Relaxed) {
+            match cvt(unsafe { fcntl(self.0.raw(), libc::F_DUPFD_CLOEXEC, ZERO) }) {
                 // `EINVAL` can only be returned on two occasions: Invalid
                 // command (second parameter) or invalid third parameter. 0 is
                 // always a valid third parameter, so it must be the second
@@ -80,14 +79,14 @@ impl Socket {
                 //
                 // Store the result in a global variable so we don't try each
                 // syscall twice.
-                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                Err(ref e) if e.raw_os_error() == Some(libc::EINVAL) => {
                     EMULATE_F_DUPFD_CLOEXEC.store(true, atomic::Ordering::Relaxed);
                 }
                 res => return res.map(|fd| Socket(FileDesc::new(fd))),
             }
         }
         cvt(
-            unsafe { fcntl(self.raw().0, libc::F_DUPFD, ZERO) }
+            unsafe { fcntl(self.0.raw(), libc::F_DUPFD, ZERO) }
         ).map(|fd| {
             let fd = FileDesc::new(fd);
             fd.set_cloexec();
