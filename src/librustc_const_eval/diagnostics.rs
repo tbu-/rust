@@ -344,6 +344,7 @@ let irr = Irrefutable(0);
 while let Irrefutable(x) = irr {
     ...
 }
+```
 
 Try this instead:
 

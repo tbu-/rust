@@ -1303,6 +1303,7 @@ denotes this will cause this error.
 struct Foo<T> {
     foo: &'static T
 }
+```
 
 This will compile, because it has the constraint on the type parameter:
 
