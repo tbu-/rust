@@ -846,8 +846,8 @@ impl<T> UnsafeCell<T> {
     ///
     /// # Safety
     ///
-    /// This function is unsafe because this thread or another thread may currently be
-    /// inspecting the inner value.
+    /// This function is not unsafe, it's only marked as such for backward
+    /// compatibility reasons.
     ///
     /// # Examples
     ///
