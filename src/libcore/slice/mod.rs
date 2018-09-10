@@ -1242,7 +1242,8 @@ impl<T> [T] {
         if size == 0 {
             return Err(0);
         }
-        let mut base = 0usize;
+        let mut base = 0;
+        let mut base_cmp = None;
         while size > 1 {
             let half = size / 2;
             let mid = base + half;
@@ -1251,10 +1252,11 @@ impl<T> [T] {
             // mid < size: mid = size / 2 + size / 4 + size / 8 ...
             let cmp = f(unsafe { s.get_unchecked(mid) });
             base = if cmp == Greater { base } else { mid };
+            base_cmp = if cmp == Greater { Some(cmp) } else { None };
             size -= half;
         }
         // base is always in [0, size) because base <= mid.
-        let cmp = f(unsafe { s.get_unchecked(base) });
+        let cmp = base_cmp.unwrap_or_else(|| f(unsafe { s.get_unchecked(base) }));
         if cmp == Equal { Ok(base) } else { Err(base + (cmp == Less) as usize) }
 
     }
