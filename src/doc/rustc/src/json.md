@@ -275,7 +275,7 @@ conjunction with the `unused-crate-dependencies` lint will emit JSON structures
 reporting any crate dependencies (specified with `--extern`) which never had any
 symbols referenced. These are intended to be consumed by the build system which
 can then emit diagnostics telling the user to remove the unused dependencies
-from `Cargo.toml` (or whatever build-system file defines dependencies).
+from `Cargo.toml` (or whatever build system file defines dependencies).
 
 The JSON structure is:
 ```json

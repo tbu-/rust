@@ -116,7 +116,7 @@ There are 3 common ways to compile native C code for UEFI targets:
 - Use the official SDK by Intel:
   [Tianocore/EDK2](https://github.com/tianocore/edk2). This supports a
   multitude of platforms, comes with the full specification transposed into C,
-  lots of examples and build-system integrations. This is also the only
+  lots of examples and build system integrations. This is also the only
   officially supported platform by Intel, and is used by many major firmware
   implementations. Any code compiled via the SDK is compatible to rust binaries
   compiled for the UEFI targets. You can link them directly into your rust
