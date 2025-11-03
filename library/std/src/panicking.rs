@@ -781,7 +781,7 @@ fn payload_as_str(payload: &dyn Any) -> &str {
     if let Some(&s) = payload.downcast_ref::<&'static str>() {
         s
     } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.as_str()
+        s
     } else {
         "Box<dyn Any>"
     }
