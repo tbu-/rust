@@ -343,7 +343,7 @@ impl Once {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for Once {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Once").finish_non_exhaustive()
+        f.debug_struct("Once").field("is_completed", &self.is_completed()).finish_non_exhaustive()
     }
 }
 
